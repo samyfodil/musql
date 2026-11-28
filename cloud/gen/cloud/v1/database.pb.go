@@ -1104,15 +1104,17 @@ func (x *UsageRequest) GetTo() *timestamppb.Timestamp {
 }
 
 type UsagePoint struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Hour          *timestamppb.Timestamp `protobuf:"bytes,1,opt,name=hour,proto3" json:"hour,omitempty"`
-	RowsRead      int64                  `protobuf:"varint,2,opt,name=rows_read,json=rowsRead,proto3" json:"rows_read,omitempty"`
-	RowsWritten   int64                  `protobuf:"varint,3,opt,name=rows_written,json=rowsWritten,proto3" json:"rows_written,omitempty"`
-	Statements    int64                  `protobuf:"varint,4,opt,name=statements,proto3" json:"statements,omitempty"`
-	Errors        int64                  `protobuf:"varint,5,opt,name=errors,proto3" json:"errors,omitempty"`
-	BytesStored   int64                  `protobuf:"varint,6,opt,name=bytes_stored,json=bytesStored,proto3" json:"bytes_stored,omitempty"`
-	P50Ms         float64                `protobuf:"fixed64,7,opt,name=p50_ms,json=p50Ms,proto3" json:"p50_ms,omitempty"`
-	P95Ms         float64                `protobuf:"fixed64,8,opt,name=p95_ms,json=p95Ms,proto3" json:"p95_ms,omitempty"`
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	Hour        *timestamppb.Timestamp `protobuf:"bytes,1,opt,name=hour,proto3" json:"hour,omitempty"`
+	RowsRead    int64                  `protobuf:"varint,2,opt,name=rows_read,json=rowsRead,proto3" json:"rows_read,omitempty"`
+	RowsWritten int64                  `protobuf:"varint,3,opt,name=rows_written,json=rowsWritten,proto3" json:"rows_written,omitempty"`
+	Statements  int64                  `protobuf:"varint,4,opt,name=statements,proto3" json:"statements,omitempty"`
+	Errors      int64                  `protobuf:"varint,5,opt,name=errors,proto3" json:"errors,omitempty"`
+	BytesStored int64                  `protobuf:"varint,6,opt,name=bytes_stored,json=bytesStored,proto3" json:"bytes_stored,omitempty"`
+	P50Ms       float64                `protobuf:"fixed64,7,opt,name=p50_ms,json=p50Ms,proto3" json:"p50_ms,omitempty"`
+	P95Ms       float64                `protobuf:"fixed64,8,opt,name=p95_ms,json=p95Ms,proto3" json:"p95_ms,omitempty"`
+	// Response body bytes the server's database handlers sent (beside Hrana).
+	BytesServed   int64 `protobuf:"varint,9,opt,name=bytes_served,json=bytesServed,proto3" json:"bytes_served,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1199,6 +1201,13 @@ func (x *UsagePoint) GetP50Ms() float64 {
 func (x *UsagePoint) GetP95Ms() float64 {
 	if x != nil {
 		return x.P95Ms
+	}
+	return 0
+}
+
+func (x *UsagePoint) GetBytesServed() int64 {
+	if x != nil {
+		return x.BytesServed
 	}
 	return 0
 }
@@ -2731,7 +2740,7 @@ const file_cloud_v1_database_proto_rawDesc = "" +
 	"\x03org\x18\x01 \x01(\tR\x03org\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12.\n" +
 	"\x04from\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\x04from\x12*\n" +
-	"\x02to\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\x02to\"\x85\x02\n" +
+	"\x02to\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\x02to\"\xa8\x02\n" +
 	"\n" +
 	"UsagePoint\x12.\n" +
 	"\x04hour\x18\x01 \x01(\v2\x1a.google.protobuf.TimestampR\x04hour\x12\x1b\n" +
@@ -2743,7 +2752,8 @@ const file_cloud_v1_database_proto_rawDesc = "" +
 	"\x06errors\x18\x05 \x01(\x03R\x06errors\x12!\n" +
 	"\fbytes_stored\x18\x06 \x01(\x03R\vbytesStored\x12\x15\n" +
 	"\x06p50_ms\x18\a \x01(\x01R\x05p50Ms\x12\x15\n" +
-	"\x06p95_ms\x18\b \x01(\x01R\x05p95Ms\"t\n" +
+	"\x06p95_ms\x18\b \x01(\x01R\x05p95Ms\x12!\n" +
+	"\fbytes_served\x18\t \x01(\x03R\vbytesServed\"t\n" +
 	"\rUsageResponse\x12,\n" +
 	"\x06points\x18\x01 \x03(\v2\x14.cloud.v1.UsagePointR\x06points\x125\n" +
 	"\tdatabases\x18\x02 \x03(\v2\x17.cloud.v1.DatabaseUsageR\tdatabases\"Q\n" +

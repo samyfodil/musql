@@ -988,12 +988,13 @@ export function UsagePage({ cloud }) {
 		for (const pts of lists)
 			for (const p of pts) {
 				const k = date(p.hour).getTime();
-				const o = byHour.get(k) ?? { t: k, rowsRead: 0, rowsWritten: 0, statements: 0, errors: 0, bytes: 0, p50: 0, p95: 0 };
+				const o = byHour.get(k) ?? { t: k, rowsRead: 0, rowsWritten: 0, statements: 0, errors: 0, bytes: 0, served: 0, p50: 0, p95: 0 };
 				o.rowsRead += Number(p.rowsRead);
 				o.rowsWritten += Number(p.rowsWritten);
 				o.statements += Number(p.statements);
 				o.errors += Number(p.errors);
 				o.bytes += Number(p.bytesStored);
+				o.served += Number(p.bytesServed);
 				o.p50 = Math.max(o.p50, p.p50Ms);
 				o.p95 = Math.max(o.p95, p.p95Ms);
 				byHour.set(k, o);
@@ -1022,6 +1023,7 @@ export function UsagePage({ cloud }) {
 					<div className="tiles">
 						{SERIES.map(([k, l]) => <div key={k} className="tile"><span className="dim small">{l}</span><b>{fmt(total(k))}</b></div>)}
 						<div className="tile"><span className="dim small">stored</span><b>{bytes(pts.at(-1)?.bytes ?? 0)}</b></div>
+						<div className="tile"><span className="dim small">served</span><b>{bytes(total("served"))}</b></div>
 					</div>
 					{!pts.length ? <div className="cloud-none dim">No activity in this window.</div> : (
 						<>

@@ -485,6 +485,13 @@ export declare type UsagePoint = Message<"cloud.v1.UsagePoint"> & {
    * @generated from field: double p95_ms = 8;
    */
   p95Ms: number;
+
+  /**
+   * Response body bytes the server's database handlers sent (beside Hrana).
+   *
+   * @generated from field: int64 bytes_served = 9;
+   */
+  bytesServed: bigint;
 };
 
 /**

@@ -179,7 +179,7 @@ func usageRange(from, to interface{ AsTime() time.Time }, hasFrom, hasTo bool) (
 
 func pointOf(h *state.UsageHour) *v1.UsagePoint {
 	return &v1.UsagePoint{Hour: stamp(h.Hour), RowsRead: h.RowsRead, RowsWritten: h.RowsWritten, Statements: h.Statements,
-		Errors: h.Errors, BytesStored: h.BytesStored, P50Ms: h.Latency.Quantile(0.5), P95Ms: h.Latency.Quantile(0.95)}
+		Errors: h.Errors, BytesStored: h.BytesStored, BytesServed: h.BytesServed, P50Ms: h.Latency.Quantile(0.5), P95Ms: h.Latency.Quantile(0.95)}
 }
 
 func (s databaseService) Usage(ctx context.Context, req *connect.Request[v1.UsageRequest]) (*connect.Response[v1.UsageResponse], error) {
@@ -245,6 +245,7 @@ func (s databaseService) Usage(ctx context.Context, req *connect.Request[v1.Usag
 		t.RowsWritten += h.RowsWritten
 		t.Errors += h.Errors
 		t.BytesStored += h.BytesStored
+		t.BytesServed += h.BytesServed
 		t.Latency.Merge(&h.Latency)
 	}
 	hours := make([]int64, 0, len(totals))

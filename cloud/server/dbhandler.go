@@ -1,8 +1,11 @@
 package server
 
 import (
+	"bufio"
 	"context"
 	"errors"
+	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -37,7 +40,8 @@ type DatabaseRequest struct {
 // database is looked up and, in a cluster, the request goes to the node that
 // serves it; the bearer token is checked, as by Hrana, and refused with 401;
 // a database whose blocks or access policy refuse reads is refused with 403
-// and the reason. h is called for each request let through.
+// and the reason. h is called for each request let through, and the response
+// body bytes its handler writes count as the database's bytes served.
 func WithDatabaseHandler(pattern string, h func(DatabaseRequest) http.Handler) Option {
 	return func(s *Server) {
 		if s.dbMux == nil {
@@ -97,7 +101,43 @@ func (s *Server) serveDBHandler(w http.ResponseWriter, r *http.Request, o *state
 		return
 	}
 	req := DatabaseRequest{Org: o, Database: d, File: s.dbPath(d), Dir: dir, Access: acc}
-	s.dbMux.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), dbRequestKey{}, req)))
+	cw := &countingWriter{ResponseWriter: w}
+	defer func() {
+		if r.Method != http.MethodHead {
+			s.meter.served(d.ID, d.OrgID, cw.n)
+		}
+	}()
+	s.dbMux.ServeHTTP(cw, r.WithContext(context.WithValue(r.Context(), dbRequestKey{}, req)))
+}
+
+// countingWriter counts the response body bytes written through it.
+// http.ResponseController reaches the writer beneath through Unwrap, and
+// Flush and Hijack keep a handler's w.(http.Flusher) and w.(http.Hijacker)
+// working. A hijacked connection's bytes are not counted.
+type countingWriter struct {
+	http.ResponseWriter
+	n int64
+}
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	n, err := c.ResponseWriter.Write(p)
+	c.n += int64(n)
+	return n, err
+}
+
+// ReadFrom keeps the writer beneath's own ReadFrom (sendfile) for io.Copy.
+func (c *countingWriter) ReadFrom(r io.Reader) (int64, error) {
+	n, err := io.Copy(c.ResponseWriter, r)
+	c.n += n
+	return n, err
+}
+
+func (c *countingWriter) Unwrap() http.ResponseWriter { return c.ResponseWriter }
+
+func (c *countingWriter) Flush() { http.NewResponseController(c.ResponseWriter).Flush() }
+
+func (c *countingWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return http.NewResponseController(c.ResponseWriter).Hijack()
 }
 
 // handlerDir is a database's WithDatabaseHandler directory.

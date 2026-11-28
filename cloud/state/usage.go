@@ -112,7 +112,9 @@ type UsageHour struct {
 	Hour                                      time.Time
 	Statements, RowsRead, RowsWritten, Errors int64
 	BytesStored                               int64
-	Latency                                   Latency
+	// BytesServed is the response body bytes database handlers sent.
+	BytesServed int64
+	Latency     Latency
 }
 
 // QueryUsage is one normalized statement's usage by one database in one hour.

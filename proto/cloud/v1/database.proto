@@ -162,6 +162,8 @@ message UsagePoint {
   int64 bytes_stored = 6;
   double p50_ms = 7;
   double p95_ms = 8;
+  // Response body bytes the server's database handlers sent (beside Hrana).
+  int64 bytes_served = 9;
 }
 
 message UsageResponse {
