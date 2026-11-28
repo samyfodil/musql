@@ -108,6 +108,7 @@ func (m *vdbe) newSubStream(ds *derivedSource, pager *ReadOnlyPager, insns []Ins
 	}
 	child := prog.newMachine(pager, nil, m.params, m)
 	child.yield, child.yieldReuse = true, true
+	child.yieldHolds = m.wctx == nil && (!m.yield || m.yieldHolds)
 	child.sink = m.sink
 	child.holder = m.streamHolder(insns)
 	if ds.stream == streamAlways {
@@ -163,7 +164,7 @@ func (s *subStream) next() (row []Value, ok bool, err error) {
 				prog := s.rest[0]
 				s.rest = s.rest[1:]
 				child := prog.newMachine(s.pager, nil, s.parent.params, s.parent)
-				child.yield, child.yieldReuse = true, true
+				child.yield, child.yieldReuse, child.yieldHolds = true, true, s.m.yieldHolds
 				child.sink, child.holder = s.parent.sink, s.m.holder
 				s.m, s.prog = child, prog
 			}

@@ -2532,15 +2532,27 @@ func (jx *vmJIT) enter(m *vdbe, pc int, rows *[][]Value) (next, n int) {
 		// run's own list and goes on: one that ends the run would leave them
 		// with native code, which the next run drops. Native code stops at
 		// each one while the collector marks (jccWB).
+		//
+		// A co-routine that holds its cursors across a yield (vdbe.yieldHolds)
+		// keeps them too, at the row it yields itself, resuming where it
+		// stopped, and at an OpResultRow the VDBE's yields.
 		exit := int(args.PC)
 		keep := exit >= 0 && exit < len(jx.safeExit) && jx.safeExit[exit] >= 0
-		if keep && unsafe.Slice(jx.insns, jx.n)[exit].Op == OpResultRow {
-			keep = args.RowsBuf != nil && !gather && !m.yield && !m.firstRow && m.maxRows <= 0
-		} else {
-			keep = keep && args.Yield == 0
+		resumeAt := -1
+		switch {
+		case args.Yield > 0 && args.RowsBuf == nil:
+			if m.yieldHolds && !gather && exit >= 0 && exit < jx.n && jx.entry[exit] {
+				resumeAt = exit
+			}
+		case keep && unsafe.Slice(jx.insns, jx.n)[exit].Op == OpResultRow:
+			if !gather && !m.firstRow && m.maxRows <= 0 && (m.yield && m.yieldHolds || args.RowsBuf != nil && !m.yield) {
+				resumeAt = int(jx.safeExit[exit])
+			}
+		case keep && args.Yield == 0:
+			resumeAt = int(jx.safeExit[exit])
 		}
-		if keep {
-			m.jDefer, m.jDeferPC, m.jDeferJX = true, int(jx.safeExit[exit]), jx
+		if resumeAt >= 0 {
+			m.jDefer, m.jDeferPC, m.jDeferJX = true, resumeAt, jx
 			// A run that ends here never takes them back.
 			for _, c := range m.jLive {
 				if jc := &m.jcur[c]; jc.Steps != 0 {
