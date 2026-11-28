@@ -49,10 +49,12 @@ import (
 // be seeked through is a selective star join, whose nested loop reads only
 // what matches, and is left alone.
 //
-// Like countCrossJoin, only for a statement with no enclosing query, and the
-// statement as written is compiled first so a prepare-time error stays its own.
+// Like countCrossJoin, only for a statement with no enclosing query (a
+// top-level one, or a subquery body compileSubProgram reaches without an outer
+// scope), and the statement as written is compiled first so a prepare-time
+// error stays its own.
 func (p *ReadOnlyPager) eagerAggregate(stmt *SelectStmt) *SelectStmt {
-	if p == nil || stmt == nil || len(stmt.From) < 3 || len(stmt.GroupBy) == 0 {
+	if p == nil || stmt == nil || p.eagerAggProbing || len(stmt.From) < 3 || len(stmt.GroupBy) == 0 {
 		return nil
 	}
 	if stmt.Distinct || len(stmt.Compound) != 0 || stmt.LimitParam != nil || stmt.OffsetParam != nil ||
@@ -114,7 +116,10 @@ func (p *ReadOnlyPager) eagerAggregate(stmt *SelectStmt) *SelectStmt {
 	if !ea.choose() {
 		return nil
 	}
-	if _, err := compileSubProgram(p, stmt, nil); err != nil {
+	p.eagerAggProbing = true
+	_, err := compileSubProgram(p, stmt, nil)
+	p.eagerAggProbing = false
+	if err != nil {
 		return nil
 	}
 	out := ea.rewrite(stmt)

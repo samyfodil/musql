@@ -145,6 +145,9 @@ type ReadOnlyPager struct {
 	// compileSubProgram leaves those arms' plans alone. See
 	// r38cFlattenCompoundArms (flatten_limit_r35c.go) for the measured reason.
 	r41ArmsHeld int
+	// eagerAggProbing is set while eagerAggregate compiles the statement as
+	// written, so that compile does not rewrite it again.
+	eagerAggProbing bool
 
 	//	// derivedSchemaOnly makes resolveFrom's derived-table branch derive the
 	//	// subquery's columns without running it (derivedSchemaCols), falling

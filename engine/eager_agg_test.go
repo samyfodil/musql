@@ -115,10 +115,16 @@ func TestEagerAggregate(t *testing.T) {
 		if ref == q {
 			t.Fatalf("%s: no reference form", q)
 		}
-		gotCols, got, gerr := p.Query(q)
-		wantCols, want, werr := p.Query(ref)
-		if fmt.Sprint(gotCols, got, gerr) != fmt.Sprint(wantCols, want, werr) {
-			t.Errorf("%s:\n got %v %v %v\nwant %v %v %v", q, gotCols, got, gerr, wantCols, want, werr)
+		// The same query as a FROM subquery and as a scalar subquery's body,
+		// which compileSubProgram rewrites.
+		// which compileSubProgram rewrites. The scalar one is named after its
+		// text, which differs.
+		for _, f := range []string{"%s", "SELECT * FROM (%s) ORDER BY 1", "SELECT (SELECT count(*) || '/' || max(n) FROM (SELECT count(*) AS n FROM (%s))) AS v"} {
+			gotCols, got, gerr := p.Query(fmt.Sprintf(f, q))
+			wantCols, want, werr := p.Query(fmt.Sprintf(f, ref))
+			if fmt.Sprint(gotCols, got, gerr) != fmt.Sprint(wantCols, want, werr) {
+				t.Errorf("%s:\n got %v %v %v\nwant %v %v %v", fmt.Sprintf(f, q), gotCols, got, gerr, wantCols, want, werr)
+			}
 		}
 	}
 }
