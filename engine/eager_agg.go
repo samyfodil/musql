@@ -123,6 +123,16 @@ func (p *ReadOnlyPager) eagerAggregate(stmt *SelectStmt) *SelectStmt {
 			return nil
 		}
 	}
+	for k := range ea.group {
+		if !ea.tieFree(ea.tabs[k[0]], k[1]) {
+			return nil
+		}
+	}
+	for _, k := range ea.ordered {
+		if !ea.tieFree(ea.tabs[k[0]], k[1]) {
+			return nil
+		}
+	}
 	if !ea.choose() {
 		return nil
 	}
@@ -158,6 +168,8 @@ type eaState struct {
 	// having is the statement while its HAVING is mapped, whose aliases a
 	// name there may be.
 	having *SelectStmt
+	// ordered holds the columns min and max read.
+	ordered [][2]int
 }
 
 type eaTable struct {
@@ -433,6 +445,9 @@ func (ea *eaState) agg(fc FuncExpr) (Expr, bool) {
 		return fc, false
 	}
 	if !ea.build {
+		if name != "count" {
+			ea.ordered = append(ea.ordered, [2]int{ti, col})
+		}
 		return fc, true
 	}
 	t := ea.tabs[ti]
@@ -461,13 +476,6 @@ func (t *eaTable) part(fn string, col int) string {
 	var call Expr = FuncExpr{Name: fn, Star: true}
 	if col >= 0 {
 		call = FuncExpr{Name: fn, Args: []Expr{ColumnExpr{Qualifier: t.name, Name: t.rt.cols[col].Name}}}
-		if coll := t.rt.cols[col].Collation; fn != "count" && !eaBinary(t.rt.cols[col]) {
-			// The outer min/max must compare under the argument column's
-			// collation, and a derived column takes its expression's. An
-			// explicit COLLATE on the outer call's argument would instead give
-			// the call's result that collation, where the original's has none.
-			call = CollateExpr{X: call, Name: coll}
-		}
 	}
 	t.parts = append(t.parts, SelectColumn{
 		Expr:     call,
@@ -663,6 +671,35 @@ func (ea *eaState) candidate(t *eaTable) bool {
 		}
 	}
 	return true
+}
+
+// tieFree reports that no two of the values t holds in col compare equal with
+// different bytes: col is BINARY, each segment stores it as a block of
+// INTEGERs, TEXTs or BLOBs with no exception and no short row, and neither the
+// delta log nor a write session's rows add one. A group's key and its min and max are then the same value
+// from whichever of its equal rows the per-key join reaches first, where C's
+// pick from its own join order (1 or 1.0, 'a' or 'A').
+func (ea *eaState) tieFree(t *eaTable, col int) bool {
+	if col == t.rt.ipkIndex {
+		return true
+	}
+	if !eaBinary(t.rt.cols[col]) || ea.p.segs == nil || ea.p.segs.isLive(t.rt.root) {
+		return false
+	}
+	segs := ea.p.segs.byRoot[t.rt.root]
+	for _, s := range segs {
+		if s.nRows == 0 {
+			continue
+		}
+		if !s.fullWidth || col >= len(s.cols) || s.hasException(col) {
+			return false
+		}
+		if ph := s.cols[col].phys; ph != PhysNull && ph != PhysInt64 && ph != PhysText && ph != PhysBlob {
+			return false
+		}
+	}
+	_, add, ok := ea.p.segs.segDeltaCorrection(t.rt.root, segs, nil)
+	return ok && add == 0
 }
 
 func eaBinary(c columnInfo) bool {

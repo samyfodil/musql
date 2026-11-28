@@ -43,23 +43,26 @@ var eagerAggSchema = []string{
 
 var eagerAggServed = []string{
 	`SELECT d.g, count(*) FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.g`,
-	`SELECT d.g, count(*) AS n, count(a.x), count(b.t), max(b.y), min(b.y), max(a.s), min(a.s), max(a.r), min(d.h), count(d.h) FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.g`,
+	`SELECT d.g, count(*) AS n, count(a.x), count(b.t), max(b.t), min(b.t), max(a.x), min(a.x), min(d.h), count(d.h) FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.g`,
 	`SELECT d.h, count(*), max(a.x) FROM fa a, d, fb b WHERE a.k = d.k AND b.k = d.k AND a.x > 5 AND b.y < 30 GROUP BY d.h HAVING count(*) > 10 ORDER BY 2 DESC, 1`,
 	`SELECT d.g, d.h, count(*) c FROM d JOIN fa a ON a.k = d.k JOIN fb b ON b.k = a.k GROUP BY d.g, d.h ORDER BY c DESC, d.g, d.h LIMIT 5 OFFSET 2`,
-	`SELECT dt.g, count(*), max(b.y) FROM fa a JOIN dt USING (k) JOIN fb b USING (k) GROUP BY dt.g`,
-	`SELECT d.g, count(*), count(c.z), max(c.z), min(a.s) FROM fa a JOIN d USING (k) JOIN fb b USING (k) JOIN fc c USING (k) GROUP BY d.g`,
+	`SELECT dt.g, count(*), max(b.t) FROM fa a JOIN dt USING (k) JOIN fb b USING (k) GROUP BY dt.g`,
+	`SELECT d.g, count(*), count(c.z), max(c.z), min(b.t) FROM fa a JOIN d USING (k) JOIN fb b USING (k) JOIN fc c USING (k) GROUP BY d.g`,
 	`SELECT d.g, count(*) FROM fa a JOIN d USING (k) JOIN fb b USING (k) WHERE d.h > 2 GROUP BY d.g`,
-	`SELECT upper(d.g) || '!', count(*) + 1, max(b.y) * 2 FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.g HAVING max(b.y) > 1 AND d.g <> 'g3'`,
+	`SELECT upper(d.g) || '!', count(*) + 1, max(a.x) * 2 FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.g HAVING max(a.x) > 1 AND d.g <> 'g3'`,
 	`SELECT d.g, count(*) FROM fia a JOIN d USING (k) JOIN fib b USING (k) GROUP BY d.g`,
 	`SELECT d.g, count(*) FROM fa a JOIN d USING (k) JOIN fb b USING (k) WHERE a.k IS NOT NULL AND b.t IS NOT NULL GROUP BY d.g ORDER BY count(*), d.g`,
 	`SELECT d.g, max(a.x), count(*) FROM d JOIN fa a ON a.k = d.k AND a.x BETWEEN 2 AND 8 JOIN fb b ON b.k = d.k AND b.t IN ('a', 'b') GROUP BY d.g`,
 	`SELECT d.g, count(*) FROM fa a JOIN d USING (k) JOIN fb b USING (k) WHERE a.r > 100 GROUP BY d.g`,
 	`SELECT d.g, count(*) FROM fa a JOIN d ON a.k = d.k JOIN fb b ON b.k = d.h GROUP BY d.g`,
-	`SELECT d.g AS gg, count(*) AS n, max(b.y) AS m FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.g HAVING n > 1000 AND gg <> 'g1' ORDER BY m, gg`,
+	`SELECT d.g AS gg, count(*) AS n, max(b.t) AS m FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.g HAVING n > 1000 AND gg <> 'g1' ORDER BY m, gg`,
 	`SELECT d2.g, count(*) FROM fa a JOIN d2 USING (k) JOIN fb b USING (k) GROUP BY d2.g`,
 }
 
 var eagerAggRefused = []string{
+	`SELECT d.g, max(b.y), min(b.y) FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.g`,
+	`SELECT d.g, max(a.s), min(a.s), max(a.r) FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.g`,
+	`SELECT d.g, count(*) FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.g, a.s`,
 	`SELECT d.h, d.g, count(*) FROM fa JOIN d ON fa.k = d.k JOIN fb ON fb.k = fa.k GROUP BY d.g`,
 	`SELECT d.g, count(*), avg(b.y) FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.g`,
 	`SELECT d.g, sum(a.x) FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.g`,
@@ -169,18 +172,16 @@ func TestEagerAggregate(t *testing.T) {
 	}
 }
 
-// TestEagerAggregateCollation: min/max of a NOCASE fact column compare under
-// NOCASE, as the join's do, but the result carries no collation of its own, so
-// HAVING and ORDER BY compare it under BINARY. Rebuilt as max(part COLLATE
-// NOCASE) it took NOCASE with it. And compare-equal values with different
-// bytes (texts under NOCASE or RTRIM, 5 and 5.0, the integer and the REAL
-// -2^63) decline, as over the join, rather than take whichever the per-key
-// join reached first.
+// TestEagerAggregateCollation: min/max and a group's key take one of the
+// group's equal values, and which one depends on the order rows arrive in. The
+// per-key join's is not C's, so a column whose equal values may differ in bytes
+// (texts under NOCASE or RTRIM, 5 and 5.0, the integer and the REAL -2^63) is
+// not rewritten, and answers as written. An INTEGER column is.
 func TestEagerAggregateCollation(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "c.musq")
 	buildDB(t, path,
-		`CREATE TABLE d(k INTEGER, g TEXT)`,
-		`INSERT INTO d SELECT value, 'g' || (value % 3) FROM generate_series(0, 19)`,
+		`CREATE TABLE d(k INTEGER, g TEXT, n)`,
+		`INSERT INTO d SELECT value, 'g' || (value % 3), CASE WHEN value % 2 THEN 1 ELSE 1.0 END FROM generate_series(0, 19)`,
 		`CREATE TABLE fa(k INTEGER, x INTEGER, s TEXT COLLATE NOCASE, u TEXT COLLATE RTRIM, v, i INTEGER)`,
 		`INSERT INTO fa SELECT value % 20, value, CASE WHEN value % 20 < 7 THEN 'a' ELSE 'B' END, CASE WHEN value % 3 = 0 THEN 'b ' ELSE 'b' END, CASE WHEN value % 3 THEN 5 ELSE 5.0 END, CASE WHEN value % 3 THEN -9223372036854775808 ELSE -9223372036854775808.0 END FROM generate_series(0, 399)`,
 		`CREATE TABLE fm(k INTEGER, s TEXT COLLATE NOCASE)`,
@@ -203,21 +204,27 @@ func TestEagerAggregateCollation(t *testing.T) {
 		`SELECT d.g, max(a.u) FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.g HAVING max(a.u) = 'b'`,
 		`SELECT d.g, max(a.v), typeof(max(a.v)) FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.g`,
 		`SELECT d.g, min(a.i), typeof(min(a.i)) FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.g`,
+		`SELECT d.n, count(*) FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.n`,
+		`SELECT d.k, min(a.x), max(a.x) FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.k`,
 	} {
 		stmt, err := parseSelectStatement(q)
 		if err != nil {
 			t.Fatalf("%s: %v", q, err)
 		}
-		if p.eagerAggregate(stmt) == nil {
-			t.Errorf("%s: not rewritten", q)
+		tieFree := strings.Contains(q, "a.x")
+		if rewritten := p.eagerAggregate(stmt) != nil; rewritten != tieFree {
+			t.Errorf("%s: rewritten %v", q, rewritten)
+		}
+		_, got, err := p.Query(q)
+		if err != nil {
+			t.Errorf("%s: %v", q, err)
+		}
+		if !tieFree {
+			continue
 		}
 		ref := strings.Replace(q, " fb b ", " (SELECT * FROM fb) b ", 1)
-		for _, f := range []string{"%s", "SELECT * FROM (%s) ORDER BY 1"} {
-			gotCols, got, gerr := p.Query(fmt.Sprintf(f, q))
-			wantCols, want, werr := p.Query(fmt.Sprintf(f, ref))
-			if fmt.Sprint(gotCols, got, gerr) != fmt.Sprint(wantCols, want, werr) {
-				t.Errorf("%s:\n got %v %v %v\nwant %v %v %v", fmt.Sprintf(f, q), gotCols, got, gerr, wantCols, want, werr)
-			}
+		if _, want, err := p.Query(ref); err != nil || fmt.Sprint(got) != fmt.Sprint(want) {
+			t.Errorf("%s:\n got %v\nwant %v %v", q, got, want, err)
 		}
 	}
 }
