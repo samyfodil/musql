@@ -127,9 +127,9 @@ func TestEagerAggregateStat1(t *testing.T) {
 
 // TestEagerAggregate: #400. A fanning-out join under count/min/max is joined
 // per key (eager_agg.go) and answers as the join itself does; the shapes it
-// must refuse keep the join. The reference for a served one is the same query with fb read
-// through a subquery, which the rewrite does not take and the flattener then
-// turns back into the plain join.
+// must refuse keep the join. The reference for a served one is the same query
+// with fb read through a subquery, which the rewrite does not take and the
+// flattener then turns back into the plain join.
 func TestEagerAggregate(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "e.musq")
 	buildDB(t, path, eagerAggSchema...)
@@ -158,7 +158,6 @@ func TestEagerAggregate(t *testing.T) {
 			t.Fatalf("%s: no reference form", q)
 		}
 		// The same query as a FROM subquery and as a scalar subquery's body,
-		// which compileSubProgram rewrites.
 		// which compileSubProgram rewrites. The scalar one is named after its
 		// text, which differs.
 		for _, f := range []string{"%s", "SELECT * FROM (%s) ORDER BY 1", "SELECT (SELECT count(*) || '/' || max(n) FROM (SELECT count(*) AS n FROM (%s))) AS v"} {
