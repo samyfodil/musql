@@ -110,14 +110,15 @@ func TestEagerAggregateIssueAsC(t *testing.T) {
 // compare under its collation, but their result carries none, so HAVING and
 // ORDER BY compare it under BINARY. And the per-key join reaches min/max in an
 // order of its own, so compare-equal values with different bytes (texts under
-// NOCASE, 1 and 1.0, the integer and the REAL -2^63) decline rather than take
-// whichever came first.
+// NOCASE, 1 and 1.0, the integer and the REAL -2^63, 0.0 and -0.0) decline
+// rather than take whichever came first. A REAL column without -0.0 is joined
+// per key.
 func TestEagerAggregateCollationAsC(t *testing.T) {
 	stmts := []string{
 		`CREATE TABLE d(k INTEGER, g TEXT, u, n TEXT COLLATE NOCASE)`,
 		`WITH RECURSIVE g(value) AS (SELECT 0 UNION ALL SELECT value + 1 FROM g WHERE value < 19) INSERT INTO d SELECT value, 'g' || (value % 3), CASE WHEN value % 2 THEN 1 ELSE 1.0 END, CASE WHEN value % 2 THEN 'x' ELSE 'X' END FROM g`,
-		`CREATE TABLE fa(k INTEGER, x INTEGER, s TEXT COLLATE NOCASE, r TEXT COLLATE RTRIM, v, i INTEGER)`,
-		`WITH RECURSIVE g(value) AS (SELECT 0 UNION ALL SELECT value + 1 FROM g WHERE value < 399) INSERT INTO fa SELECT value % 20, value, CASE WHEN value % 20 < 7 THEN 'a' ELSE 'B' END, CASE WHEN value % 3 = 0 THEN 'b ' ELSE 'b' END, CASE WHEN value % 3 THEN 5 ELSE 5.0 END, CASE WHEN value % 3 THEN -9223372036854775808 ELSE -9223372036854775808.0 END FROM g`,
+		`CREATE TABLE fa(k INTEGER, x INTEGER, s TEXT COLLATE NOCASE, r TEXT COLLATE RTRIM, v, i INTEGER, w, z REAL)`,
+		`WITH RECURSIVE g(value) AS (SELECT 0 UNION ALL SELECT value + 1 FROM g WHERE value < 399) INSERT INTO fa SELECT value % 20, value, CASE WHEN value % 20 < 7 THEN 'a' ELSE 'B' END, CASE WHEN value % 3 = 0 THEN 'b ' ELSE 'b' END, CASE WHEN value % 3 THEN 5 ELSE 5.0 END, CASE WHEN value % 3 THEN -9223372036854775808 ELSE -9223372036854775808.0 END, CASE WHEN value % 3 THEN 0.0 ELSE -0.0 END, (value % 7) / 2.0 - 1 FROM g`,
 		`CREATE TABLE fm(k INTEGER, s TEXT COLLATE NOCASE)`,
 		`WITH RECURSIVE g(value) AS (SELECT 0 UNION ALL SELECT value + 1 FROM g WHERE value < 399) INSERT INTO fm SELECT value % 20, char(CASE value % 3 WHEN 0 THEN 97 WHEN 1 THEN 65 ELSE 98 END) FROM g`,
 		`CREATE TABLE fb(k INTEGER, y)`,
@@ -137,6 +138,8 @@ func TestEagerAggregateCollationAsC(t *testing.T) {
 		`SELECT d.u, typeof(d.u), count(*) FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.u`,
 		`SELECT d.n, count(*), max(b.y) FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.n`,
 		`SELECT d.n, count(*) FROM d JOIN fa a USING (k) JOIN fb b USING (k) GROUP BY d.n`,
+		`SELECT d.g, max(a.w), min(a.w), count(*) FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.g`,
+		`SELECT d.k, min(a.z), max(a.z), count(*) FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.k`,
 	} {
 		differ(t, "eager-agg-collation", append(append([]string{}, stmts...), q))
 	}

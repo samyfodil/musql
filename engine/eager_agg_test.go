@@ -231,6 +231,105 @@ func TestEagerAggregateCollation(t *testing.T) {
 	}
 }
 
+// TestEagerAggregateDeltaRows: the rows the delta log holds are classed with
+// the segments' own. A table whose rows are all in the log is rewritten; a
+// REAL beside INTEGERs, or a -0.0, that only the log holds is not.
+func TestEagerAggregateDeltaRows(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "d.musq")
+	buildDB(t, path,
+		`CREATE TABLE d(k INTEGER, g TEXT)`,
+		`INSERT INTO d SELECT value, 'g' || (value % 3) FROM generate_series(0, 19)`,
+		`CREATE TABLE fa(k INTEGER, x INTEGER, v, w)`,
+		`INSERT INTO fa SELECT value % 20, value, value % 7, value % 5 * 1.5 FROM generate_series(0, 399)`,
+		`CREATE TABLE fb(k INTEGER, y)`,
+		`INSERT INTO fb SELECT value % 20, value FROM generate_series(0, 399)`,
+		`CREATE TABLE fl(k INTEGER, z REAL)`,
+	)
+	execDB(t, path, `VACUUM`)
+	execDB(t, path,
+		`INSERT INTO fl SELECT value % 20, value / 4.0 FROM generate_series(0, 399)`,
+		`INSERT INTO fa VALUES (3, 1000, 5.0, -0.0)`,
+	)
+	p, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	schema, err := p.Schema()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range schema {
+		if (r.Name == "fa" || r.Name == "fl") && p.segCleanFor(r.RootPage) {
+			t.Fatalf("%s has no rows in the delta log", r.Name)
+		}
+	}
+	for _, c := range []struct {
+		q    string
+		want bool
+	}{
+		{`SELECT d.g, count(*), min(a.x), max(a.x) FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.g`, true},
+		{`SELECT d.g, count(*), min(l.z), max(l.z) FROM fl l JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.g`, true},
+		{`SELECT d.g, max(a.v), min(a.v) FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.g`, false},
+		{`SELECT d.g, min(a.w), max(a.w) FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.g`, false},
+	} {
+		stmt, err := parseSelectStatement(c.q)
+		if err != nil {
+			t.Fatalf("%s: %v", c.q, err)
+		}
+		if got := p.eagerAggregate(stmt) != nil; got != c.want {
+			t.Errorf("%s: rewritten %v, want %v", c.q, got, c.want)
+		}
+		_, got, err := p.Query(c.q)
+		if err != nil {
+			t.Errorf("%s: %v", c.q, err)
+		}
+		if !c.want {
+			continue
+		}
+		ref := strings.Replace(c.q, " fb b ", " (SELECT * FROM fb) b ", 1)
+		if _, want, werr := p.Query(ref); werr != nil || fmt.Sprint(got) != fmt.Sprint(want) {
+			t.Errorf("%s:\n got %v %v\nwant %v %v", c.q, got, err, want, werr)
+		}
+	}
+}
+
+// TestEagerAggregateSession: a write session, as the driver holds one per
+// connection, reads a table it has not written from the committed rows, and
+// its reads are rewritten as a read-only pager's are. Once it holds a write to
+// one of the join's tables, its rows are that write's and are not classed.
+func TestEagerAggregateSession(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "s.musq")
+	buildDB(t, path, eagerAggSchema...)
+	db, err := OpenWrite(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Discard()
+	stmt, err := parseSelectStatement(eagerAggServed[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	rewritten := func() bool {
+		pg, err := db.SnapshotPager()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return pg.eagerAggregate(stmt) != nil
+	}
+	if !rewritten() {
+		t.Errorf("a session that wrote nothing: not rewritten")
+	}
+	for _, s := range []string{`BEGIN`, `INSERT INTO fb VALUES (1, 2.5, 'q')`} {
+		if err := db.Exec(s); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if rewritten() {
+		t.Errorf("a session holding a write to fb: rewritten")
+	}
+}
+
 // TestEagerAggregateFanout: the rewrite fires on the facts' own rows per key,
 // not on their size against the dim's. Facts with many keys, or a key per
 // row, joined to a small dim make a small join, which the per-key subqueries,

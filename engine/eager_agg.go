@@ -581,10 +581,10 @@ func (ea *eaState) choose() bool {
 }
 
 // keyBound bounds how many distinct values t's key holds: its integer cells
-// counted in a bitmap over their span, plus a value for every row the delta log
-// adds; or else its rows, where the key is not a block of integers or the
-// bitmap would be larger than the column. A NULL cell counts as whatever it
-// holds, which can only add one.
+// and the delta log's integer keys counted in a bitmap over their span, plus a
+// value for every other key the log holds; or else its rows, where the key is
+// not a block of integers or the bitmap would be larger than the column. A
+// NULL cell counts as whatever it holds, which can only add one.
 func (ea *eaState) keyBound(t *eaTable, rows int64) int64 {
 	if t.key == t.rt.ipkIndex || ea.p.segs == nil {
 		return rows
@@ -605,12 +605,24 @@ func (ea *eaState) keyBound(t *eaTable, rows int64) int64 {
 		}
 		cols = append(cols, vals)
 	}
-	_, add, ok := ea.p.segs.segDeltaCorrection(t.rt.root, segs, nil)
-	if !ok {
-		return rows
+	var other int64
+	if ti, ok := ea.p.segs.tableOf[t.rt.root]; ok && ea.p.segs.delta != nil {
+		var keys []int64
+		for _, row := range ea.p.segs.delta.live[ti] {
+			if t.key < len(row) && row[t.key].Typ == Int {
+				v := row[t.key].I
+				lo, hi = min(lo, v), max(hi, v)
+				keys = append(keys, v)
+			} else {
+				other++
+			}
+		}
+		if len(keys) != 0 {
+			cols = append(cols, keys)
+		}
 	}
 	if lo > hi {
-		return min(rows, int64(add))
+		return min(rows, other)
 	}
 	span := uint64(hi) - uint64(lo) + 1
 	if span == 0 || span > 64*uint64(rows) {
@@ -623,7 +635,7 @@ func (ea *eaState) keyBound(t *eaTable, rows int64) int64 {
 			seen[i/64] |= 1 << (i % 64)
 		}
 	}
-	n := int64(add)
+	n := other
 	for _, w := range seen {
 		n += int64(bits.OnesCount64(w))
 	}
@@ -675,21 +687,26 @@ func (ea *eaState) candidate(t *eaTable) bool {
 }
 
 // tieFree reports that no two of the values t holds in col compare equal with
-// different bytes: col is BINARY, each segment stores it as a block of
-// INTEGERs, REALs other than -0.0, TEXTs or BLOBs with no exception and no
-// short row, and neither the delta log nor a write session's rows add one. A
-// group's key and its min and max are then the same value from whichever of
-// its equal rows the per-key join reaches first, where C's pick from its own
-// join order (1 or 1.0, 0.0 or -0.0, 'a' or 'A').
+// different bytes: col is BINARY, holds no INTEGER beside a REAL and no -0.0,
+// each segment stores it as one class with no exception and no short row, and
+// no write session's rows are pending. A group's key and its min and max are
+// then the same value from whichever of its equal rows the per-key join
+// reaches first, where C's pick from its own join order (1 or 1.0, 0.0 or
+// -0.0, 'a' or 'A').
 func (ea *eaState) tieFree(t *eaTable, col int) bool {
 	if col == t.rt.ipkIndex {
 		return true
 	}
-	if !eaBinary(t.rt.cols[col]) || ea.p.segs == nil || ea.p.segs.isLive(t.rt.root) {
+	src := ea.p.segs
+	if !eaBinary(t.rt.cols[col]) || src == nil {
 		return false
 	}
-	segs := ea.p.segs.byRoot[t.rt.root]
-	for _, s := range segs {
+	if _, loaded := src.live[t.rt.root]; loaded {
+		return false
+	}
+	var ints, reals bool
+	negZero := func(v float64) bool { return v == 0 && math.Signbit(v) }
+	for _, s := range src.byRoot[t.rt.root] {
 		if s.nRows == 0 {
 			continue
 		}
@@ -697,18 +714,36 @@ func (ea *eaState) tieFree(t *eaTable, col int) bool {
 			return false
 		}
 		switch s.cols[col].phys {
-		case PhysNull, PhysInt64, PhysText, PhysBlob:
+		case PhysNull, PhysText, PhysBlob:
+		case PhysInt64:
+			ints = true
 		case PhysFloat64:
 			f, ok := s.float64Block(col)
-			if !ok || slices.ContainsFunc(f, func(v float64) bool { return v == 0 && math.Signbit(v) }) {
+			if !ok || slices.ContainsFunc(f, negZero) {
 				return false
 			}
+			reals = true
 		default:
 			return false
 		}
 	}
-	_, add, ok := ea.p.segs.segDeltaCorrection(t.rt.root, segs, nil)
-	return ok && add == 0
+	if ti, ok := src.tableOf[t.rt.root]; ok && src.delta != nil {
+		for _, row := range src.delta.live[ti] {
+			if col >= len(row) {
+				return false
+			}
+			switch v := row[col]; v.Typ {
+			case Int:
+				ints = true
+			case Float:
+				if negZero(v.F) {
+					return false
+				}
+				reals = true
+			}
+		}
+	}
+	return !ints || !reals
 }
 
 func eaBinary(c columnInfo) bool {
