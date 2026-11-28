@@ -299,33 +299,38 @@ func (p *windowPlan) windowRowCtx(m *vdbe, entry []Value, winVals []Value) *eval
 	}
 }
 
-// windowRowCtxs hands out windowRowCtx for batch rows one at a time. One
-// context and one decoded row serve every row, since a step reads its row
-// context only while it runs -- except an aggregate with an ORDER BY, whose
-// buffer keeps the first row's context for the replay at finalize
-// (aggItem.obBuffer): that one gets a context and a row of its own each time.
+// windowRowCtxs hands out the windowRowCtx acc's step of a batch row runs
+// with. The only thing a step reads from its context's row is a collation
+// resolved against it, once per accumulator (aggItem.rowCollationPending), so
+// the row's columns and rowids are decoded only while acc may still resolve
+// one; otherwise the one shared context keeps whichever row it last held. An
+// aggregate with an ORDER BY keeps the context its collations resolved
+// against for the replay at finalize (aggItem.obBuffer), so that one gets a
+// context and a row of its own.
 type windowRowCtxs struct {
 	m     *vdbe
 	plan  *windowPlan
 	batch *windowRows
 	vals  [][]Value
-	fresh bool
 	ctx   *evalCtx
 	buf   []Value
 }
 
-func (w *windowRowCtxs) at(ri int) *evalCtx {
+func (w *windowRowCtxs) at(ri int, acc *aggItem) *evalCtx {
 	p := w.plan
-	if w.fresh {
-		return p.windowRowCtx(w.m, w.batch.row(ri), w.vals[ri])
+	n := p.nCols + p.nRowids
+	pending := acc.rowCollationPending()
+	switch {
+	case pending && acc.orderBy != nil:
+		var row []Value
+		return p.windowRowCtx(w.m, w.batch.rangeInto(ri, 0, n, &row), w.vals[ri])
+	case w.ctx == nil:
+		w.ctx = p.windowRowCtx(w.m, w.batch.rangeInto(ri, 0, n, &w.buf), w.vals[ri])
+	case pending:
+		entry := w.batch.rangeInto(ri, 0, n, &w.buf)
+		w.ctx.vals = entry[:p.nCols]
+		w.ctx.rowids = entry[p.nCols:n]
 	}
-	entry := w.batch.rowInto(ri, 0, &w.buf)
-	if w.ctx == nil {
-		w.ctx = p.windowRowCtx(w.m, entry, w.vals[ri])
-		return w.ctx
-	}
-	w.ctx.vals = entry[:p.nCols]
-	w.ctx.rowids = entry[p.nCols : p.nCols+p.nRowids]
 	w.ctx.windowVals = w.vals[ri]
 	return w.ctx
 }
@@ -856,7 +861,7 @@ func (m *vdbe) outerOrderCollations(plan *windowPlan, batch *windowRows, vals []
 	if len(plan.orderTerms) == 0 || batch.len() == 0 {
 		return nil
 	}
-	ctx := plan.windowRowCtx(m, batch.row(0), vals[0])
+	ctx := plan.windowRowCtx(m, batch.headRow(plan.nCols+plan.nRowids), vals[0])
 	out := make([]string, len(plan.orderTerms))
 	for i, ot := range plan.orderTerms {
 		e := ot.Expr
@@ -1005,7 +1010,7 @@ func (m *vdbe) windowKeyCollations(plan *windowPlan, exprs []Expr, batch *window
 	if len(exprs) == 0 || batch.len() == 0 {
 		return nil
 	}
-	ctx := plan.windowRowCtx(m, batch.row(0), vals[0])
+	ctx := plan.windowRowCtx(m, batch.headRow(plan.nCols+plan.nRowids), vals[0])
 	out := make([]string, len(exprs))
 	for i, e := range exprs {
 		if name, ok := topExprCollation(ctx, e); ok {
@@ -1275,15 +1280,18 @@ func (m *vdbe) windowAggregate(plan *windowPlan, call windowCall, ci int, part [
 		opBuf    []Value
 		argBuf   []Value
 	)
-	rows := windowRowCtxs{m: m, plan: plan, batch: batch, vals: vals, fresh: tmpl.orderBy != nil}
+	rows := windowRowCtxs{m: m, plan: plan, batch: batch, vals: vals}
 	if call.stepArgs != nil {
 		stepPM = call.stepArgs.machine(m)
 		stampWindowStepArgRegs(tmpl, plan, call)
 	}
+	base := plan.nCols + plan.nRowids
+	read := tmpl.operandRegsRead()
 	// regsFor is one row's argument registers for a step (or an inverse), or
-	// skip when its FILTER rules it out before any argument is coded.
+	// skip when its FILTER rules it out before any argument is coded. Of the
+	// operand block only the cells the accumulator reads are decoded.
 	regsFor := func(ri int) (regs []Value, skip bool, err error) {
-		regs = batch.rowInto(ri, plan.nCols+plan.nRowids, &opBuf)
+		regs = batch.pickInto(ri, base, batch.width(ri)-base, read, &opBuf)
 		if stepPM != nil {
 			// C's windowAggStep tests the BUFFERED filter column first and
 			// its OP_IfNot jumps past the whole argument coding
@@ -1330,7 +1338,7 @@ func (m *vdbe) windowAggregate(plan *windowPlan, call windowCall, ci int, part [
 				if skip {
 					continue
 				}
-				if err := acc.step(rows.at(ri), regs); err != nil {
+				if err := acc.step(rows.at(ri, acc), regs); err != nil {
 					return err
 				}
 			}
@@ -1373,7 +1381,7 @@ func (m *vdbe) windowAggregate(plan *windowPlan, call windowCall, ci int, part [
 			if skip {
 				continue
 			}
-			if err := acc.step(rows.at(ri), regs); err != nil {
+			if err := acc.step(rows.at(ri, acc), regs); err != nil {
 				return err
 			}
 		}
@@ -1397,7 +1405,7 @@ func (m *vdbe) windowIncrementalAggregate(call windowCall, ci int, part []int, s
 		if err != nil || skip {
 			return err
 		}
-		ctx := rows.at(ri)
+		ctx := rows.at(ri, acc)
 		if tmpl.kind != aggGroupConcat {
 			return acc.step(ctx, regs)
 		}
@@ -1413,7 +1421,7 @@ func (m *vdbe) windowIncrementalAggregate(call windowCall, ci int, part []int, s
 		if err != nil || skip {
 			return err
 		}
-		ctx := rows.at(ri)
+		ctx := rows.at(ri, acc)
 		if tmpl.kind != aggGroupConcat {
 			return acc.inverse(ctx, regs)
 		}
@@ -1529,10 +1537,6 @@ func stampWindowStepArgRegs(tmpl *aggItem, plan *windowPlan, call windowCall) {
 		tmpl.rowRegs[aggExprSep] = plan.nOps + 2
 	}
 }
-
-// operandVals is one batch entry's OPERAND block -- the columns
-// planWindowOperands appended after the [cols.., rowids..] payload, indexed by
-// the same operand column number vdbe.windowOperand reads.
 
 // compileNoFromWindow compiles a FROM-less window SELECT ("SELECT sum(44) OVER
 // ()", or the correlated inner query of "SELECT (SELECT sum(a) OVER (ORDER BY

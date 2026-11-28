@@ -506,18 +506,16 @@ func (m *vdbe) windowPeerLoopImmune(plan *windowPlan, batch *windowRows, run []i
 	}
 	nSrc := len(plan.srcColOfs) - 1
 	varying := 0
-	first := batch.row(run[0])
-	var buf []Value
+	first := run[0]
 	for i := 0; i < nSrc; i++ {
 		lo, hi := plan.srcColOfs[i], plan.srcColOfs[i+1]
 		same := true
 		for _, ri := range run[1:] {
-			e := batch.rowInto(ri, 0, &buf)
-			if !windowEntriesIdentical(first[lo:hi], e[lo:hi]) {
+			if !batch.identicalRange(first, ri, lo, hi) {
 				same = false
 				break
 			}
-			if r := plan.nCols + i; r < len(first) && r < len(e) && !valuesIdentical(first[r], e[r]) {
+			if r := plan.nCols + i; r < batch.width(first) && r < batch.width(ri) && !batch.identicalRange(first, ri, r, r+1) {
 				same = false
 				break
 			}

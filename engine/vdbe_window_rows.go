@@ -26,7 +26,8 @@ type windowRows struct {
 	chunks [][]byte
 	// esc holds the rare value whose I and F are both nonzero beside its
 	// bytes, which a cell's two words cannot hold all three of.
-	esc []Value
+	esc  []Value
+	head []Value // headRow's
 }
 
 type winCell struct {
@@ -168,22 +169,50 @@ func (r *windowRows) at(ri, i int) Value {
 	return r.value(&r.cellsOf(ri)[i])
 }
 
-// rowInto decodes values [from, width) of row ri into buf, reusing its
-// storage, and returns them.
-func (r *windowRows) rowInto(ri, from int, buf *[]Value) []Value {
+// rangeInto decodes values [from, to) of row ri into buf, reusing its
+// storage, and returns them: to-from values, NULL past the row's width.
+func (r *windowRows) rangeInto(ri, from, to int, buf *[]Value) []Value {
+	out := growValues(buf, max(to-from, 0))
 	cs := r.cellsOf(ri)
-	cs = cs[min(from, len(cs)):]
-	out := growValues(buf, len(cs))
-	for i := range cs {
-		out[i] = r.value(&cs[i])
+	for i := range out {
+		if j := from + i; j < len(cs) {
+			out[i] = r.value(&cs[j])
+		}
 	}
 	return out
 }
 
-// row is row ri decoded into a slice of its own.
-func (r *windowRows) row(ri int) []Value {
-	var buf []Value
-	return r.rowInto(ri, 0, &buf)
+// pickInto is row ri's n values from base on, of which only those at the
+// offsets in idx are decoded, into buf: the cells it never names stay NULL,
+// since buf is only ever filled at the same offsets.
+func (r *windowRows) pickInto(ri, base, n int, idx []int, buf *[]Value) []Value {
+	n = max(n, 0)
+	if cap(*buf) < n {
+		*buf = make([]Value, n)
+	}
+	out := (*buf)[:n]
+	cs := r.cellsOf(ri)
+	for _, i := range idx {
+		if i >= n {
+			continue
+		}
+		if j := base + i; j < len(cs) {
+			out[i] = r.value(&cs[j])
+		} else {
+			out[i] = Value{}
+		}
+	}
+	return out
+}
+
+// headRow is row 0's first n values, decoded once: rows are append-only, so
+// row 0 never changes once it is there.
+func (r *windowRows) headRow(n int) []Value {
+	if r.head == nil || len(r.head) != n {
+		var buf []Value
+		r.head = r.rangeInto(0, 0, n, &buf)
+	}
+	return r.head
 }
 
 // identical is windowEntriesIdentical over rows ri and rj.
@@ -192,6 +221,21 @@ func (r *windowRows) identical(ri, rj int) bool {
 	if len(a) != len(b) {
 		return false
 	}
+	return r.cellsIdentical(a, b)
+}
+
+// identicalRange is windowEntriesIdentical over values [lo, hi) of rows ri
+// and rj.
+func (r *windowRows) identicalRange(ri, rj, lo, hi int) bool {
+	a, b := r.cellsOf(ri), r.cellsOf(rj)
+	a, b = a[min(lo, len(a)):min(hi, len(a))], b[min(lo, len(b)):min(hi, len(b))]
+	if len(a) != len(b) {
+		return false
+	}
+	return r.cellsIdentical(a, b)
+}
+
+func (r *windowRows) cellsIdentical(a, b []winCell) bool {
 	for i := range a {
 		if !valuesIdentical(r.value(&a[i]), r.value(&b[i])) {
 			return false

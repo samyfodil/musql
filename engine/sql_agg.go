@@ -579,6 +579,35 @@ func (it *aggItem) argCollation(ctx *evalCtx) string {
 	return it.argColl
 }
 
+// rowCollationPending reports whether a step may still resolve a collation
+// against its row context: argCollation, which only a DISTINCT, min() or max()
+// step reaches, and the ORDER BY terms obBuffer resolves, each once. Nothing
+// else a step does reads the context's row (rowValue reads regs), which is
+// what lets the window path skip decoding that row (windowRowCtxs.at).
+func (it *aggItem) rowCollationPending() bool {
+	if it.orderBy != nil {
+		return it.ob == nil || !it.ob.collSet
+	}
+	return !it.argCollSet && (it.distinct || it.kind == aggMin || it.kind == aggMax)
+}
+
+// operandRegsRead is every offset into regs a step reads (rowValue, obBuffer):
+// the stamped rowRegs and obRegs, unbiased.
+func (it *aggItem) operandRegsRead() []int {
+	var out []int
+	for _, r := range it.rowRegs {
+		if r > 0 {
+			out = append(out, r-1)
+		}
+	}
+	for _, r := range it.obRegs {
+		if r > 0 {
+			out = append(out, r-1)
+		}
+	}
+	return out
+}
+
 // obBuffer is updateAccumulator's ORDER BY arm (select.c:6857-6925) for one
 // admitted row: the keys and the argument values go into the buffer, in
 // arrival order, instead of into the accumulation. A DISTINCT is applied HERE,
