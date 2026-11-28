@@ -28,6 +28,15 @@ func inlineOperands(in Instruction) bool {
 		return in.P4 == nil || rowFilterMoves(in.P4)
 	case OpFunction:
 		return inlineFunctionMoves(in)
+	case OpSubquery, OpExists:
+		sub, ok := in.P4.(*Program)
+		return ok && in.P5&p5Correlated == 0 && sameRowsEveryRun(sub)
+	case OpInSub:
+		plan, ok := in.P4.(*inSubPlan)
+		return ok && !plan.correlated && sameRowsEveryRun(plan.prog)
+	case OpRowSub:
+		plan, ok := in.P4.(*rowSubPlan)
+		return ok && !plan.correlated && sameRowsEveryRun(plan.prog)
 	case OpInit, OpGoto, OpHalt, OpResultRow, OpGosub, OpReturn,
 		OpOpenRead, OpOpenDerived, OpNext, OpIfEmpty, OpClose, OpAutoIndexOrder,
 		OpColumn, OpRowid, OpOuterColumn, OpOuterRowid,
@@ -92,8 +101,37 @@ func (x inlineReloc) relocate(in Instruction) Instruction {
 		r.P1, r.P2 = x.reg(in.P1), x.jump(in.P2)
 	case OpFunction:
 		r.P1, r.P3 = x.reg(in.P1), x.reg(in.P3)
+	case OpSubquery, OpExists:
+		r.P1, r.P2 = x.reg(in.P1), in.P2+x.slotOff
+	case OpInSub, OpRowSub:
+		r.P1, r.P2, r.P3 = x.reg(in.P1), x.reg(in.P2), in.P3+x.slotOff
 	}
 	return r
+}
+
+// outerRead is in, a read of a frame in.P5 levels up, in a body inlined into
+// the frame one level up: level 1 is then the program's own cursor.
+func (x inlineReloc) outerRead(in Instruction) Instruction {
+	switch {
+	case in.Op == OpOuterColumn && in.P5 == 1:
+		return Instruction{Op: OpColumn, P1: in.P1, P2: in.P2, P3: x.reg(in.P3)}
+	case in.Op == OpOuterRowid && in.P5 == 1:
+		return Instruction{Op: OpRowid, P1: in.P1, P2: x.reg(in.P2)}
+	case in.Op == OpOuterColumn:
+		in.P3 = x.reg(in.P3)
+	default:
+		in.P2 = x.reg(in.P2)
+	}
+	in.P5--
+	return in
+}
+
+// sameRowsEveryRun reports whether an uncorrelated subquery in a body gives
+// the same rows on every run of the body, which is when keptSubquery would
+// keep them. Inlined, it runs once a statement from the program's own slot,
+// as C's OP_Once does, rather than once per run of the body's machine.
+func sameRowsEveryRun(sub *Program) bool {
+	return sub != nil && !sub.Correlated && subKeepable(sub) && subCTEsShared(sub)
 }
 
 // rowFilterMoves reports whether a Rewind's P4 moves unchanged. A row filter

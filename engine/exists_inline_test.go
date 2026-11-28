@@ -40,6 +40,9 @@ func TestExistsInlineMatchesSubProgram(t *testing.T) {
 		`SELECT k, count(*) FROM t WHERE EXISTS (SELECT 1 FROM b WHERE b.id = t.bid) GROUP BY k ORDER BY k`,
 		`SELECT count(*) FROM t AS o WHERE EXISTS (SELECT 1 FROM b WHERE b.id = o.bid AND EXISTS (SELECT 1 FROM t AS i WHERE i.id = o.id AND i.k = b.id % 5))`,
 		`SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM b WHERE b.id = t.bid AND b.id < ?)`,
+		`SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM b WHERE b.id = t.bid AND b.w > (SELECT avg(w) FROM b))`,
+		`SELECT count(*) FROM t WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.id = t.bid AND b.id IN (SELECT e.id FROM e))`,
+		`SELECT count(*) FROM t WHERE t.k < (SELECT count(*) FROM e) + 3 AND EXISTS (SELECT 1 FROM b WHERE b.id = t.bid AND b.w > (SELECT avg(w) FROM b))`,
 		// A scan whose leading WHERE compiles to a row filter on its Rewind.
 		`SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM b WHERE b.w < 3 AND b.label = 'l' || t.k)`,
 	}

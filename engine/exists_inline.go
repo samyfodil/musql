@@ -35,16 +35,16 @@ func existsInlinePeephole(prog *Program) {
 			continue
 		}
 		sub, ok := op.P4.(*Program)
-		if !ok || !existsInlinable(sub) {
+		if !ok || !bodyInlinable(sub) {
 			continue
 		}
 		existsInline(prog, i, sub)
 	}
 }
 
-// existsInlinable reports whether sub is a correlated EXISTS body this pass
-// can relocate.
-func existsInlinable(sub *Program) bool {
+// bodyInlinable reports whether sub, a correlated EXISTS or scalar subquery,
+// is a body these passes can relocate.
+func bodyInlinable(sub *Program) bool {
 	if sub == nil || sub.Compound != nil || sub.LiveSource != nil ||
 		sub.NSorters != 0 || sub.NDistinct != 0 || sub.NRecRegs != 0 ||
 		len(sub.Insns) == 0 || sub.Insns[0].Op != OpInit {
@@ -184,7 +184,6 @@ func existsInline(prog *Program, at int, sub *Program) {
 		none, some = 1, 0
 	}
 	x := inlineReloc{regOff: regOff, curOff: curOff, slotOff: slotOff, jump: func(a int) int { return body + a }}
-	reg, cur := x.reg, x.cur
 
 	out := append(prog.Insns, Instruction{Op: OpInteger, P1: none, P2: dest})
 	for _, in := range sub.Insns {
@@ -196,21 +195,8 @@ func existsInline(prog *Program, at int, sub *Program) {
 			r = Instruction{Op: OpGoto, P2: done}
 		case OpResultRow:
 			r = Instruction{Op: OpGoto, P2: found}
-		case OpOuterColumn:
-			// One frame closer: level 1 is now this program's own cursor.
-			r = in
-			if in.P5 == 1 {
-				r = Instruction{Op: OpColumn, P1: in.P1, P2: in.P2, P3: reg(in.P3)}
-			} else {
-				r.P3, r.P5 = reg(in.P3), in.P5-1
-			}
-		case OpOuterRowid:
-			r = in
-			if in.P5 == 1 {
-				r = Instruction{Op: OpRowid, P1: in.P1, P2: reg(in.P2)}
-			} else {
-				r.P2, r.P5 = reg(in.P2), in.P5-1
-			}
+		case OpOuterColumn, OpOuterRowid:
+			r = x.outerRead(in)
 		default:
 			r = x.relocate(in)
 		}
@@ -219,7 +205,7 @@ func existsInline(prog *Program, at int, sub *Program) {
 	// found: the answer is yes; close what the body left open.
 	out = append(out, Instruction{Op: OpInteger, P1: some, P2: dest})
 	for c := 0; c < sub.NCursors; c++ {
-		out = append(out, Instruction{Op: OpClose, P1: cur(c)})
+		out = append(out, Instruction{Op: OpClose, P1: x.cur(c)})
 	}
 	out = append(out, Instruction{Op: OpReturn, P1: retReg})
 	// done: no row; the body closed its cursors before its Halt.

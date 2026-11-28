@@ -176,6 +176,7 @@ func TestRecInlineWalksATable(t *testing.T) {
 		`CREATE TABLE emp(id INTEGER PRIMARY KEY, boss INTEGER, name TEXT)`,
 		`WITH RECURSIVE g(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM g WHERE i < 400) INSERT INTO emp SELECT i, CASE WHEN i = 1 THEN NULL ELSE i / 2 END, 'e' || i FROM g`)
 	queries := []string{
+		`WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < (SELECT count(*) FROM plain WHERE a < 50)) SELECT count(*), sum(n) FROM r`,
 		// Down an index on edge(a).
 		`WITH RECURSIVE r(n, d) AS (SELECT 1, 0 UNION SELECT edge.b, d + 1 FROM r JOIN edge ON edge.a = r.n WHERE d < 12) SELECT count(*), sum(n), max(d) FROM r`,
 		`WITH RECURSIVE r(n, p) AS (SELECT 3, '3' UNION ALL SELECT edge.b, p || '>' || edge.b FROM r, edge WHERE edge.a = r.n AND edge.w < 30) SELECT count(*), max(p), min(p) FROM r`,

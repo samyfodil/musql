@@ -336,6 +336,7 @@ func (p *ReadOnlyPager) compileRecursiveCTEPart(stmt *SelectStmt, queue *compile
 	prog, err := compileSubProgram(p, stmt, outer)
 	if err == nil && !segPeepholesOffForTest {
 		existsInlinePeephole(prog)
+		subqueryInlinePeephole(prog)
 	}
 	return prog, err
 }
