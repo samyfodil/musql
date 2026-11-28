@@ -30,9 +30,14 @@ func TestWindowRowsRoundTrip(t *testing.T) {
 		{Typ: Text, S: []byte("both"), I: 7, F: 1.25},
 		{Typ: Float, F: 1e300, I: 9},
 	}
-	want := func(v Value) Value { return recordValue(v) }
+	// Every value here is payload of a column read with REAL affinity, where
+	// an IntReal is stored as the REAL it reads as (appendRow).
+	want := func(v Value) Value {
+		v.intReal = false
+		return v
+	}
 	var r windowRows
-	r.appendRow([]Value{{Typ: Blob, S: big}, {Typ: Text, S: []byte("after")}})
+	r.appendRow([]Value{{Typ: Blob, S: big}, {Typ: Text, S: []byte("after")}}, allReal(2))
 	if g := r.at(0, 0); !bytes.Equal(g.S, big) || g.Typ != Blob {
 		t.Fatalf("big blob read back as %d bytes of type %v", len(g.S), g.Typ)
 	}
@@ -46,7 +51,7 @@ func TestWindowRowsRoundTrip(t *testing.T) {
 		for j := range row {
 			row[j] = vals[(i+j)%len(vals)]
 		}
-		r.appendRow(row)
+		r.appendRow(row, allReal(len(row)))
 	}
 	if r.len() != n {
 		t.Fatalf("len %d, want %d", r.len(), n)
@@ -80,7 +85,7 @@ func TestWindowRowsRoundTrip(t *testing.T) {
 	held := r.at(7, 0)
 	before := append([]byte(nil), held.S...)
 	for range 1000 {
-		r.appendRow([]Value{{Typ: Text, S: []byte("later")}})
+		r.appendRow([]Value{{Typ: Text, S: []byte("later")}}, allReal(1))
 	}
 	if !bytes.Equal(held.S, before) {
 		t.Fatalf("held bytes changed: %q, was %q", held.S, before)
@@ -96,7 +101,7 @@ func wideWindowRows(n, nCols, nOps int) *windowRows {
 		for j := range row {
 			row[j] = Value{Typ: Int, I: int64(i*1000 + j)}
 		}
-		r.appendRow(row)
+		r.appendRow(row, make([]bool, nCols+1))
 	}
 	return &r
 }
@@ -192,4 +197,12 @@ func TestWindowHeadRowDecodedOnce(t *testing.T) {
 	if before > 2 {
 		t.Fatalf("windowKeyCollations allocates %v times per call", before)
 	}
+}
+
+func allReal(n int) []bool {
+	b := make([]bool, n)
+	for i := range b {
+		b[i] = true
+	}
+	return b
 }
