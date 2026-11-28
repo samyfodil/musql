@@ -416,6 +416,22 @@ func (cur *vdbeCursor) firstSeekKey() idxSeekKey {
 	return idxSeekKey{col: cur.idxSeekCol, probe: cur.idxSeekProbe, coll: cur.idxSeekColl, set: cur.idxSeekSet, rng: cur.idxSeekRange}
 }
 
+// seekPins reports whether the index seek holds table column c to one number.
+// Only a numeric column: its values compare as numbers under any collation, so
+// equal to the probe means tied in any order on c.
+func (cur *vdbeCursor) seekPins(c int) bool {
+	if c >= len(cur.tbl.cols) || !isNumericAffinity(cur.tbl.cols[c].Aff) {
+		return false
+	}
+	pins := func(k idxSeekKey) bool {
+		return k.col == c && k.set == nil && k.rng == nil && (k.probe.Typ == Int || k.probe.Typ == Float)
+	}
+	if pins(cur.firstSeekKey()) {
+		return true
+	}
+	return slices.ContainsFunc(cur.idxSeekMore, pins)
+}
+
 // seekNarrowRatio is how many rows a native walk reads in the time a seek
 // fetches one (about 10 ns against 2.5 us, measured over 300k rows).
 const seekNarrowRatio = 256
@@ -1351,7 +1367,7 @@ func (cur *vdbeCursor) rewind() error {
 			}
 			cur.idxListReady = false
 			if cur.seekReseek || cur.idxListOnce {
-				if src, served := cur.pager.segListSeekIndex(cur, &cur.pointSrc); served && src.sortListBy(cur.idxSeekOrder) {
+				if src, served := cur.pager.segListSeekIndex(cur, &cur.pointSrc); served && src.sortListBy(cur.idxSeekOrder, cur.seekPins) {
 					segIndexSeeksServed.Add(1)
 					cur.seekGen = seekGens.Add(1)
 					cur.rowids, cur.rows = cur.rowids[:0], cur.rows[:0]
@@ -1377,7 +1393,7 @@ func (cur *vdbeCursor) rewind() error {
 				// that materializes once may have its rows permuted in place
 				// (OpAutoIndexOrder) or tagged by position (OpMultiOrTag).
 				if cur.seekReseek || cur.idxListOnce {
-					if src, served := cur.pager.segListSeek(cur, rowids, &cur.pointSrc); served && src.sortListBy(cur.idxSeekOrder) {
+					if src, served := cur.pager.segListSeek(cur, rowids, &cur.pointSrc); served && src.sortListBy(cur.idxSeekOrder, cur.seekPins) {
 						cur.seekGen = seekGens.Add(1)
 						// Positioned, not built, as a rowid seek is above.
 						cur.segSrc, cur.segCur, cur.segSrcCols = src, nil, src.cols

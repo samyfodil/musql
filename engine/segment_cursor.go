@@ -143,9 +143,11 @@ type segRowSource struct {
 	listOne *segment
 	// listKeys and listPerm are sortListBy's, and listHits segListSeekIndex's,
 	// kept across seeks as the list is.
-	listKeys []int64
-	listPerm []int
-	listHits []int32
+	listKeys    []int64
+	listPerm    []int
+	listKeyCols []int
+	listKeyDesc []bool
+	listHits    []int32
 
 	// ahead is the rows a scan has pulled past the cursor's (lookahead), which
 	// next serves, from aheadPos, before pulling more; drained is set once a
@@ -399,17 +401,31 @@ func (p *ReadOnlyPager) segListSeekIndex(cur *vdbeCursor, into *segRowSource) (s
 // rows and sorts them, autoIndexOrderCursor). Ties keep their rowid order, as
 // the index's own does. A list already in order -- an equality seek whose key
 // is its own column, ties in rowid order -- is left as it is.
-func (src *segRowSource) sortListBy(key *autoIndexKey) bool {
+//
+// A key column pinned is one the seek holds to a single number: every row the
+// re-checked WHERE keeps ties on it, so it is not read.
+func (src *segRowSource) sortListBy(key *autoIndexKey, pinned func(c int) bool) bool {
 	n := len(src.listRows)
 	if key == nil || n < 2 {
 		return true
 	}
-	nk := len(key.cols)
+	cols, desc := src.listKeyCols[:0], src.listKeyDesc[:0]
+	for k, c := range key.cols {
+		if c >= 0 && pinned(c) {
+			continue
+		}
+		cols, desc = append(cols, c), append(desc, k < len(key.desc) && key.desc[k])
+	}
+	src.listKeyCols, src.listKeyDesc = cols, desc
+	nk := len(cols)
+	if nk == 0 {
+		return true
+	}
 	less := func(ka, kb []int64) int {
 		for k := range ka {
 			if ka[k] != kb[k] {
 				c := cmp.Compare(ka[k], kb[k])
-				if k < len(key.desc) && key.desc[k] {
+				if desc[k] {
 					return -c
 				}
 				return c
@@ -423,7 +439,7 @@ func (src *segRowSource) sortListBy(key *autoIndexKey) bool {
 		row := src.listRows[i]
 		rid := s.Rowid(row)
 		width := min(s.Width(row), len(src.cols))
-		for _, c := range key.cols {
+		for _, c := range cols {
 			if c < 0 {
 				flat = append(flat, int64(rid))
 				continue
