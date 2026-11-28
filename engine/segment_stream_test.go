@@ -104,8 +104,9 @@ func TestSegStreamMatchesBuildSegment(t *testing.T) {
 // TestLazyColumnIndexMatchesFile: a segment written without its indexes (an
 // append load's) answers every equality lookup exactly as the same rows'
 // segment with indexes in the file does -- integer, REAL and TEXT columns, a
-// column with NULLs (no index either way) -- and an index-less segment holding
-// a short row answers from none, since its cell is not what the row reads as.
+// column with NULLs (indexed over its other rows either way) -- and an
+// index-less segment holding a short row answers from none, since its cell is
+// not what the row reads as.
 func TestLazyColumnIndexMatchesFile(t *testing.T) {
 	cols := []columnInfo{{Name: "k"}, {Name: "f"}, {Name: "s"}, {Name: "n"}}
 	var rowids []uint64
@@ -141,8 +142,8 @@ func TestLazyColumnIndexMatchesFile(t *testing.T) {
 		}
 	}
 	for v := int64(-1); v < 40; v++ {
-		want, okW := file.segEqualityRows(0, v)
-		got, okG := lazy.segEqualityRows(0, v)
+		want, okW := file.seekRows(0, Value{Typ: Int, I: v}, nil)
+		got, okG := lazy.seekRows(0, Value{Typ: Int, I: v}, nil)
 		if !okW || !okG || !slices.Equal(want, got) {
 			t.Fatalf("k = %d: file %v %v, lazy %v %v", v, okW, want, okG, got)
 		}
@@ -157,10 +158,16 @@ func TestLazyColumnIndexMatchesFile(t *testing.T) {
 		if okW != okG || !slices.Equal(sw, sgot) {
 			t.Fatalf("s = %s: file %v %v, lazy %v %v", p, okW, sw, okG, sgot)
 		}
-		_, okW = file.segEqualityRows(3, v)
-		_, okG = lazy.segEqualityRows(3, v)
-		if okW || okG {
-			t.Fatal("a column with NULLs answered from an index")
+		var want3 []int32
+		for i, r := range rows {
+			if r[3].Typ == Int && r[3].I == v {
+				want3 = append(want3, int32(i))
+			}
+		}
+		for _, sg := range []*segment{file, lazy} {
+			if got, ok := sg.seekRows(3, Value{Typ: Int, I: v}, nil); !ok || !slices.Equal(got, want3) {
+				t.Fatalf("n = %d: %v %v, want %v", v, ok, got, want3)
+			}
 		}
 	}
 
@@ -174,7 +181,7 @@ func TestLazyColumnIndexMatchesFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := sg.segEqualityRows(0, 0); ok {
+	if _, ok := sg.seekRows(0, Value{Typ: Int, I: 0}, nil); ok {
 		t.Fatal("a segment with a short row built an index from its cells")
 	}
 }

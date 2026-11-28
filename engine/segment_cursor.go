@@ -365,20 +365,7 @@ func (p *ReadOnlyPager) segListSeekIndex(cur *vdbeCursor, into *segRowSource) (s
 			return nil, false
 		}
 		var have bool
-		switch probe.Typ {
-		case Int:
-			sg.eqMu.Lock()
-			x, ok := sg.diskIndexFor(cur.idxSeekCol)
-			sg.eqMu.Unlock()
-			if have = ok && x.codec == segIdxCodecPostings; have {
-				hits = x.rowsFor(probe.I, hits[:0])
-			}
-		case Text, Blob:
-			hits, have = sg.segEqualityRowsBytes(cur.idxSeekCol, probe.S)
-		case Float:
-			hits, have = sg.segEqualityRowsFloat(cur.idxSeekCol, probe.F)
-		}
-		if !have {
+		if hits, have = sg.seekRows(cur.idxSeekCol, probe, hits[:0]); !have {
 			return nil, false
 		}
 		for _, i := range hits {
