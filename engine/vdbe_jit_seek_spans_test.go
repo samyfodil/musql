@@ -104,7 +104,59 @@ func TestVMJITIdxSeekAcrossSegments(t *testing.T) {
 	if segCursorsHere() && enters[1] > 100 {
 		t.Errorf("%d entries into native code for %d seeks: a key the segments share leaves it at each seek", enters[1], 404)
 	}
+	// At most a few per row of u: none walks t for its NULL.
+	for i, n := range enters {
+		if segCursorsHere() && n > 1000 {
+			t.Errorf("%s: %d entries into native code for 404 seeks", queries[i], n)
+		}
+	}
 	t.Logf("entries per query %v", enters)
+}
+
+// TestIndexSeekOfNullReadsNothing: a correlated equality whose probe is NULL
+// matches no row, so its seek reads none, where it was left to a scan of the
+// table that tested every row.
+func TestIndexSeekOfNullReadsNothing(t *testing.T) {
+	old := vmJITEnabled
+	vmJITEnabled = false
+	defer func() { vmJITEnabled = old }()
+	path := filepath.Join(t.TempDir(), "n.musq")
+	buildDB(t, path,
+		"CREATE TABLE t(id INTEGER PRIMARY KEY, k INT, s TEXT)",
+		"CREATE INDEX tk ON t(k)",
+		"CREATE INDEX ts ON t(s)",
+		"CREATE TABLE u(id INTEGER PRIMARY KEY, w)",
+		"CREATE TABLE v(id INTEGER PRIMARY KEY, w TEXT)",
+		"INSERT INTO t SELECT value, value % 50, 's' || (value % 50) FROM generate_series(1, 20000)",
+		"INSERT INTO u VALUES(1, NULL), (2, 7), (3, NULL), (4, NULL), (5, NULL)",
+		"INSERT INTO v SELECT id, 's' || w FROM u")
+	execDB(t, path, "VACUUM")
+	p, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	var rc RowCounter
+	p.SetRowCounter(&rc)
+	want := fmt.Sprint(typedRows([][]Value{{{Typ: Int, I: 1}, {}}, {{Typ: Int, I: 2}, {Typ: Int, I: 19957}}, {{Typ: Int, I: 3}, {}}, {{Typ: Int, I: 4}, {}}, {{Typ: Int, I: 5}, {}}}))
+	for _, q := range []string{
+		"SELECT u.id, (SELECT max(t.id) FROM t WHERE t.k = u.w) FROM u",
+		"SELECT v.id, (SELECT max(t.id) FROM t WHERE t.s = v.w) FROM v",
+		"SELECT u.id, (SELECT max(t.id) FROM t WHERE t.k = u.w AND t.s = 's7') FROM u",
+	} {
+		read := rc.Read
+		_, rows, err := p.QueryArgs(q, nil)
+		if err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+		if got := fmt.Sprint(typedRows(rows)); got != want {
+			t.Errorf("%s: %s", q, got)
+		}
+		// The outer rows and the 400 of key 7, not the table's 20,000.
+		if n := rc.Read - read; n > 1000 {
+			t.Errorf("%s: %d rows read", q, n)
+		}
+	}
 }
 
 // TestVMJITCoroutineKeepsCursors: a FROM-clause subquery run as a co-routine

@@ -498,6 +498,10 @@ func (p *ReadOnlyPager) SeekIndexRowidsByKeys(rootPage uint32, keys []idxSeekKey
 	if p == nil || p.segs == nil {
 		return nil, false
 	}
+	// A NULL equals no row: a key that probes one leaves nothing to fetch.
+	if slices.ContainsFunc(keys, func(k idxSeekKey) bool { return k.probe.Typ == Null && k.set == nil && k.rng == nil }) {
+		return nil, true
+	}
 	if len(keys) == 1 {
 		k := keys[0]
 		if n, total, ok := p.segs.seekIndexKeyEstimate(rootPage, k); ok && total >= seekMinRows && 2*n >= total {
