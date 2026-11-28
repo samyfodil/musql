@@ -339,6 +339,9 @@ func (w *windowRowCtxs) at(ri int, acc *aggItem) *evalCtx {
 	case pending && acc.orderBy != nil:
 		var row []Value
 		return p.windowRowCtx(w.m, w.batch.rangeInto(ri, 0, n, &row), w.vals[ri])
+	case w.ctx == nil && w.rowFree:
+		// Any row will do, and row 0 is decoded once for the whole batch.
+		w.ctx = p.windowRowCtx(w.m, w.batch.headRow(n), w.vals[ri])
 	case w.ctx == nil:
 		w.ctx = p.windowRowCtx(w.m, w.batch.rangeInto(ri, 0, n, &w.buf), w.vals[ri])
 	case pending && !w.rowFree:
