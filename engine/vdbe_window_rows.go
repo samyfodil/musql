@@ -67,8 +67,14 @@ func (r *windowRows) appendRow(vals []Value) {
 		k++
 	}
 	off := len(r.cells[k])
+	r.cells[k] = r.cells[k][:off+len(vals)]
+	cs := r.cells[k][off:]
 	for i := range vals {
-		r.cells[k] = append(r.cells[k], r.cell(recordValue(vals[i])))
+		if v := &vals[i]; v.S == nil && !v.intReal {
+			cs[i] = winCell{typ: v.Typ, sub: v.Subtype, a: uint64(v.I), b: math.Float64bits(v.F)}
+			continue
+		}
+		cs[i] = r.cell(recordValue(vals[i]))
 	}
 	if r.n&(1<<winRowChunkLg-1) == 0 {
 		r.rows = append(r.rows, make([]winRow, 0, 1<<winRowChunkLg))

@@ -755,16 +755,17 @@ func (p *windowProjection) machine(m *vdbe) *vdbe {
 // is ever readable.
 func (p *windowProjection) run(pm *vdbe, batch *windowRows, ri int, winVals, out []Value) ([]Value, error) {
 	clear(pm.regs)
-	w := batch.width(ri)
+	cs := batch.cellsOf(ri)
+	w := len(cs)
 	// The batch entry's trailing rowid block, one slot per joined table
 	// (compileScanWindow emits one OpRowid per source into it). Bounded by what
 	// the entry actually carries, since a shorter entry must leave the tail
 	// registers at the NULL the clear above put there.
 	for i := range min(p.nRowids, w-p.nCols) {
-		pm.regs[p.rowidReg+i] = batch.at(ri, p.nCols+i)
+		pm.regs[p.rowidReg+i] = batch.value(&cs[p.nCols+i])
 	}
 	for i := range min(p.nCols, w) {
-		pm.regs[p.colBase+i] = batch.at(ri, i)
+		pm.regs[p.colBase+i] = batch.value(&cs[i])
 	}
 	// The entry's OPERAND tail, whose leading len(bufRegs) columns are the
 	// references this projection buffered (planWindowOperands puts them
@@ -773,7 +774,7 @@ func (p *windowProjection) run(pm *vdbe, batch *windowRows, ri int, winVals, out
 	// Bounded by the entry like the rowid block above.
 	for i, r := range p.bufRegs {
 		if j := p.nCols + p.nRowids + i; j < w {
-			pm.regs[r] = batch.at(ri, j)
+			pm.regs[r] = batch.value(&cs[j])
 		}
 	}
 	copy(pm.regs[p.winBase:p.winBase+p.nWin], winVals)
