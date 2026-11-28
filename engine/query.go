@@ -1296,6 +1296,11 @@ func (p *ReadOnlyPager) execSelect(stmt *SelectStmt, outer *evalCtx, params []Va
 		if f := p.countCrossJoin(stmt); f != nil {
 			return p.execNoFromKeyed(f, outer, params, cacheKey)
 		}
+		// A fanning-out join under count/min/max is joined per key instead
+		// (eager_agg.go).
+		if f := p.eagerAggregate(stmt); f != nil {
+			stmt = f
+		}
 	}
 
 	// C flattens a FROM subquery into its parent before planning, so the parent's
