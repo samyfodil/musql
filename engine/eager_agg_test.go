@@ -11,7 +11,7 @@ import (
 // TestEagerAggregateAsC: facts fa, fb, fc over a dim d with duplicate keys,
 // NULL keys and values, a NOCASE column whose order differs from BINARY's, a
 // TEXT-keyed dim, an untyped and a NOCASE key, indexed copies of the facts,
-// and a dim too large for the facts to fan out.
+// and a dim larger than the facts' key count, which they still fan out against.
 var eagerAggSchema = []string{
 	`CREATE TABLE fa(k INTEGER, x INTEGER, s TEXT COLLATE NOCASE, r REAL)`,
 	`INSERT INTO fa SELECT CASE WHEN value % 97 = 0 THEN NULL ELSE value % 53 END, CASE WHEN value % 7 = 0 THEN NULL ELSE value % 11 END, CASE WHEN value % 26 < 13 THEN char(97 + value % 26) ELSE char(65 + value % 26) END, (value % 100) / 8.0 FROM generate_series(1, 2000)`,
@@ -56,6 +56,7 @@ var eagerAggServed = []string{
 	`SELECT d.g, count(*) FROM fa a JOIN d USING (k) JOIN fb b USING (k) WHERE a.r > 100 GROUP BY d.g`,
 	`SELECT d.g, count(*) FROM fa a JOIN d ON a.k = d.k JOIN fb b ON b.k = d.h GROUP BY d.g`,
 	`SELECT d.g AS gg, count(*) AS n, max(b.y) AS m FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.g HAVING n > 1000 AND gg <> 'g1' ORDER BY m, gg`,
+	`SELECT d2.g, count(*) FROM fa a JOIN d2 USING (k) JOIN fb b USING (k) GROUP BY d2.g`,
 }
 
 var eagerAggRefused = []string{
@@ -74,7 +75,6 @@ var eagerAggRefused = []string{
 	`SELECT d.g, count(*) OVER () FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.g`,
 	`SELECT DISTINCT d.h, count(*) FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.g`,
 	`SELECT d.g, count(*) FROM fia a JOIN d USING (k) JOIN fib b USING (k) WHERE d.h = 1 GROUP BY d.g`,
-	`SELECT d2.g, count(*) FROM fa a JOIN d2 USING (k) JOIN fb b USING (k) GROUP BY d2.g`,
 	`SELECT a.x, count(*) FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY a.x`,
 	`SELECT count(*) FROM fa a JOIN d USING (k) JOIN fb b USING (k)`,
 	`SELECT k, count(*) FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY k`,
@@ -86,18 +86,19 @@ var eagerAggRefused = []string{
 }
 
 // TestEagerAggregateStat1: ANALYZE's rows per key decide the fan-out where an
-// index on the key has them: facts as large against the dim as fa and fb, but
-// with a key each row of its own, are left to the join.
+// index on the key has them. Keys too sparse to count in a bitmap over their
+// span leave the facts' fan-out unknown, and the join as written, until
+// ANALYZE has measured it.
 func TestEagerAggregateStat1(t *testing.T) {
 	schema := []string{
 		`CREATE TABLE ua(k INTEGER, x INTEGER)`,
-		`INSERT INTO ua SELECT value, value % 9 FROM generate_series(1, 2000)`,
+		`INSERT INTO ua SELECT value % 40 * 1000000, value % 9 FROM generate_series(1, 2000)`,
 		`CREATE INDEX ua_k ON ua(k)`,
 		`CREATE TABLE ub(k INTEGER, y INTEGER)`,
-		`INSERT INTO ub SELECT value, value % 5 FROM generate_series(1, 2000)`,
+		`INSERT INTO ub SELECT value % 40 * 1000000, value % 5 FROM generate_series(1, 2000)`,
 		`CREATE INDEX ub_k ON ub(k)`,
 		`CREATE TABLE d(k INTEGER, g TEXT)`,
-		`INSERT INTO d SELECT value * 30, 'g' || (value % 3) FROM generate_series(1, 60)`,
+		`INSERT INTO d SELECT value % 40 * 1000000, 'g' || (value % 3) FROM generate_series(1, 60)`,
 	}
 	q := `SELECT d.g, count(*), max(b.y) FROM ua a JOIN d USING (k) JOIN ub b USING (k) GROUP BY d.g`
 	for _, analyzed := range []bool{false, true} {
@@ -115,7 +116,7 @@ func TestEagerAggregateStat1(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got := p.eagerAggregate(stmt) != nil; got == analyzed {
+		if got := p.eagerAggregate(stmt) != nil; got != analyzed {
 			t.Errorf("analyzed=%v: rewritten %v", analyzed, got)
 		}
 		p.Close()
@@ -164,6 +165,109 @@ func TestEagerAggregate(t *testing.T) {
 			if fmt.Sprint(gotCols, got, gerr) != fmt.Sprint(wantCols, want, werr) {
 				t.Errorf("%s:\n got %v %v %v\nwant %v %v %v", fmt.Sprintf(f, q), gotCols, got, gerr, wantCols, want, werr)
 			}
+		}
+	}
+}
+
+// TestEagerAggregateCollation: min/max of a NOCASE fact column compare under
+// NOCASE, as the join's do, but the result carries no collation of its own, so
+// HAVING and ORDER BY compare it under BINARY. Rebuilt as max(part COLLATE
+// NOCASE) it took NOCASE with it. And compare-equal values with different
+// bytes (texts under NOCASE or RTRIM, 5 and 5.0, the integer and the REAL
+// -2^63) decline, as over the join, rather than take whichever the per-key
+// join reached first.
+func TestEagerAggregateCollation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "c.musq")
+	buildDB(t, path,
+		`CREATE TABLE d(k INTEGER, g TEXT)`,
+		`INSERT INTO d SELECT value, 'g' || (value % 3) FROM generate_series(0, 19)`,
+		`CREATE TABLE fa(k INTEGER, x INTEGER, s TEXT COLLATE NOCASE, u TEXT COLLATE RTRIM, v, i INTEGER)`,
+		`INSERT INTO fa SELECT value % 20, value, CASE WHEN value % 20 < 7 THEN 'a' ELSE 'B' END, CASE WHEN value % 3 = 0 THEN 'b ' ELSE 'b' END, CASE WHEN value % 3 THEN 5 ELSE 5.0 END, CASE WHEN value % 3 THEN -9223372036854775808 ELSE -9223372036854775808.0 END FROM generate_series(0, 399)`,
+		`CREATE TABLE fm(k INTEGER, s TEXT COLLATE NOCASE)`,
+		`INSERT INTO fm SELECT value % 20, char(CASE value % 3 WHEN 0 THEN 97 WHEN 1 THEN 65 ELSE 98 END) FROM generate_series(0, 399)`,
+		`CREATE TABLE fb(k INTEGER, y)`,
+		`INSERT INTO fb SELECT value % 20, value FROM generate_series(0, 399)`,
+	)
+	p, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	for _, q := range []string{
+		`SELECT d.k, min(a.s) FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.k HAVING min(a.s) < 'B'`,
+		`SELECT d.k, min(a.s) AS m FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.k HAVING m < 'B'`,
+		`SELECT d.k, min(a.s) FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.k ORDER BY min(a.s), d.k`,
+		`SELECT d.k, max(a.s) AS m FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.k ORDER BY m DESC, d.k`,
+		`SELECT d.g, max(a.s) FROM fm a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.g HAVING max(a.s) = 'B'`,
+		`SELECT d.g, max(a.s), min(a.s) FROM fm a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.g HAVING min(a.s) = 'A'`,
+		`SELECT d.g, max(a.u) FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.g HAVING max(a.u) = 'b'`,
+		`SELECT d.g, max(a.v), typeof(max(a.v)) FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.g`,
+		`SELECT d.g, min(a.i), typeof(min(a.i)) FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.g`,
+	} {
+		stmt, err := parseSelectStatement(q)
+		if err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+		if p.eagerAggregate(stmt) == nil {
+			t.Errorf("%s: not rewritten", q)
+		}
+		ref := strings.Replace(q, " fb b ", " (SELECT * FROM fb) b ", 1)
+		for _, f := range []string{"%s", "SELECT * FROM (%s) ORDER BY 1"} {
+			gotCols, got, gerr := p.Query(fmt.Sprintf(f, q))
+			wantCols, want, werr := p.Query(fmt.Sprintf(f, ref))
+			if fmt.Sprint(gotCols, got, gerr) != fmt.Sprint(wantCols, want, werr) {
+				t.Errorf("%s:\n got %v %v %v\nwant %v %v %v", fmt.Sprintf(f, q), gotCols, got, gerr, wantCols, want, werr)
+			}
+		}
+	}
+}
+
+// TestEagerAggregateFanout: the rewrite fires on the facts' own rows per key,
+// not on their size against the dim's. Facts with many keys, or a key per
+// row, joined to a small dim make a small join, which the per-key subqueries,
+// joined to each other without an index, would make far slower. Facts with
+// few keys still fan out, against a dim of any size.
+func TestEagerAggregateFanout(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "f.musq")
+	buildDB(t, path,
+		`CREATE TABLE d(k INTEGER, g TEXT)`,
+		`INSERT INTO d SELECT value * 7, 'g' || (value % 10) FROM generate_series(0, 99)`,
+		`CREATE TABLE ma(k INTEGER, x INTEGER)`,
+		`INSERT INTO ma SELECT value % 5000, value FROM generate_series(0, 19999)`,
+		`CREATE TABLE mb(k INTEGER, y INTEGER)`,
+		`INSERT INTO mb SELECT value % 5000, value FROM generate_series(0, 19999)`,
+		`CREATE TABLE ua(k INTEGER, x INTEGER)`,
+		`INSERT INTO ua SELECT value, value FROM generate_series(0, 19999)`,
+		`CREATE TABLE ub(k INTEGER, y INTEGER)`,
+		`INSERT INTO ub SELECT value, value FROM generate_series(0, 19999)`,
+		`CREATE TABLE fa(k INTEGER, x INTEGER)`,
+		`INSERT INTO fa SELECT value % 100 * 7, value FROM generate_series(0, 19999)`,
+		`CREATE TABLE fb(k INTEGER, y INTEGER)`,
+		`INSERT INTO fb SELECT value % 100 * 7, value FROM generate_series(0, 19999)`,
+		`CREATE TABLE big(k INTEGER, g TEXT)`,
+		`INSERT INTO big SELECT value % 700, 'g' || (value % 10) FROM generate_series(0, 39999)`,
+	)
+	p, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	for _, c := range []struct {
+		q    string
+		want bool
+	}{
+		{`SELECT d.g, count(*), max(b.y) FROM d JOIN ma a USING (k) JOIN mb b USING (k) GROUP BY d.g`, false},
+		{`SELECT d.g, count(*), max(b.y) FROM ma a JOIN d USING (k) JOIN mb b USING (k) GROUP BY d.g`, false},
+		{`SELECT d.g, count(*), max(b.y) FROM ua a JOIN d USING (k) JOIN ub b USING (k) GROUP BY d.g`, false},
+		{`SELECT d.g, count(*), max(b.y) FROM d JOIN fa a USING (k) JOIN fb b USING (k) GROUP BY d.g`, true},
+		{`SELECT big.g, count(*), max(b.y) FROM fa a JOIN big USING (k) JOIN fb b USING (k) GROUP BY big.g`, true},
+	} {
+		stmt, err := parseSelectStatement(c.q)
+		if err != nil {
+			t.Fatalf("%s: %v", c.q, err)
+		}
+		if got := p.eagerAggregate(stmt) != nil; got != c.want {
+			t.Errorf("%s: rewritten %v, want %v", c.q, got, c.want)
 		}
 	}
 }

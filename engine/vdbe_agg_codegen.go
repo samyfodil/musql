@@ -164,7 +164,7 @@ func compileScanAggregate(c *compiler, stmt *SelectStmt, srcs []joinSource, scop
 	// An ORDER-SENSITIVE AGGREGATE needs a row order proven too, for its own
 	// reason -- see armOrderSensitive, which takes the SAME proof the anchor
 	// does.
-	orderProvable := len(allAggs) == 0 || !anyOrderSensitive(allAggs) ||
+	orderProvable := len(allAggs) == 0 || !anyOrderSensitive(allAggs) || !stmt.orderNotC &&
 		withFromPlanTrust(c, savedNQueryLoop, savedNQueryLoopKnown, func() bool {
 			return aggPlanOrderProvable(c.pager, c, srcs, scopes, stmt)
 		})
@@ -215,7 +215,7 @@ func compileScanAggregate(c *compiler, stmt *SelectStmt, srcs []joinSource, scop
 		// count(*) FROM t1,t2 WHERE ... HAVING group_concat(t2.c)='...'", whose
 		// select list is order-free). Planned after the arming above, so it is
 		// armed here.
-		armOrderSensitive(!anyOrderSensitive(hp.aggTemplates) ||
+		armOrderSensitive(!anyOrderSensitive(hp.aggTemplates) || !stmt.orderNotC &&
 			withFromPlanTrust(c, savedNQueryLoop, savedNQueryLoopKnown, func() bool {
 				return aggPlanOrderProvable(c.pager, c, srcs, scopes, stmt)
 			}), hp.aggTemplates)
@@ -2005,7 +2005,7 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 		}
 		anchorChk = chk
 	}
-	armOrderSensitive(!anyOrderSensitive(aggs) ||
+	armOrderSensitive(!anyOrderSensitive(aggs) || !stmt.orderNotC &&
 		withFromPlanTrust(c, savedNQueryLoop, savedNQueryLoopKnown, func() bool {
 			return aggPlanOrderProvable(p, c, srcs, scopes, stmt)
 		}), aggs)

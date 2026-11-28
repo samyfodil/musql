@@ -2,6 +2,8 @@ package engine
 
 import (
 	"fmt"
+	"math"
+	"math/bits"
 	"strings"
 )
 
@@ -43,11 +45,16 @@ import (
 // into '1' and '1.0'. A derived table's column keeps its column's affinity, so
 // every other comparison converts the group's values alike.
 //
-// The rewrite fires only where it pays: at least two facts each with at least
-// eagerAggMinFanout rows per key: what ANALYZE measured through an index on the
-// key, or else the table's rows over the smallest kept table's. A filter on a
-// kept table with an index the facts could be seeked through is a selective
-// star join, whose nested loop reads only what matches, and is left alone.
+// The rewrite fires only where it pays (choose): at least two facts each with
+// at least eagerAggMinFanout rows per key, and a join as written larger than
+// the walk the rewritten one makes. A filter on a kept table with an index the
+// facts could be seeked through is a selective star join, whose nested loop
+// reads only what matches, and is left alone.
+//
+// The rewritten join reaches the aggregates in an order of its own, so a
+// min/max that meets two compare-equal values with different bytes (texts
+// under NOCASE, 1 and 1.0) declines, as one does over a join whose order is not
+// provably C's (orderNotC).
 //
 // Like countCrossJoin, only for a statement with no enclosing query (a
 // top-level one, or a subquery body compileSubProgram reaches without an outer
@@ -439,13 +446,7 @@ func (ea *eaState) agg(fc FuncExpr) (Expr, bool) {
 	if name == "count" {
 		return ea.sum(eaTimes(part, ea.product(ti))), true
 	}
-	var arg Expr = part
-	if coll := t.rt.cols[col].Collation; coll != "" && !strings.EqualFold(coll, "BINARY") {
-		// The per-key column has no collation of its own; the original's
-		// comparison is the argument column's.
-		arg = CollateExpr{X: part, Name: coll}
-	}
-	return FuncExpr{Name: name, Args: []Expr{arg}}, true
+	return FuncExpr{Name: name, Args: []Expr{part}}, true
 }
 
 // part returns the name of t's per-key partial fn(col), adding it on first
@@ -457,9 +458,16 @@ func (t *eaTable) part(fn string, col int) string {
 	}
 	n := fmt.Sprintf("musql_ea_%d", len(t.parts))
 	t.partOf[k] = n
-	call := FuncExpr{Name: fn, Star: true}
+	var call Expr = FuncExpr{Name: fn, Star: true}
 	if col >= 0 {
 		call = FuncExpr{Name: fn, Args: []Expr{ColumnExpr{Qualifier: t.name, Name: t.rt.cols[col].Name}}}
+		if coll := t.rt.cols[col].Collation; fn != "count" && !eaBinary(t.rt.cols[col]) {
+			// The outer min/max must compare under the argument column's
+			// collation, and a derived column takes its expression's. An
+			// explicit COLLATE on the outer call's argument would instead give
+			// the call's result that collation, where the original's has none.
+			call = CollateExpr{X: call, Name: coll}
+		}
 	}
 	t.parts = append(t.parts, SelectColumn{
 		Expr:     call,
@@ -493,7 +501,13 @@ func eaTimes(l, r Expr) Expr {
 
 func (ea *eaState) sum(e Expr) Expr { return FuncExpr{Name: "sum", Args: []Expr{e}} }
 
-// choose picks the facts and reports whether the rewrite pays.
+// choose picks the facts and reports whether the rewrite pays. A fact fans
+// out when it has at least eagerAggMinFanout rows per key: what ANALYZE
+// measured, or else its rows over its key's values (keyBound). The per-key
+// subqueries are joined to each other without an index, so the rewritten join
+// walks up to the product of their key counts, and it pays only when the join
+// as written, estimated as the smallest kept table's rows times every fact's
+// rows per key, is at least that large.
 func (ea *eaState) choose() bool {
 	kept := int64(-1)
 	rows := make([]int64, len(ea.tabs))
@@ -511,20 +525,23 @@ func (ea *eaState) choose() bool {
 		return false
 	}
 	facts := 0
+	join, walk := float64(kept), 1.0
 	for i, t := range ea.tabs {
-		if !ea.candidate(t) {
+		if !ea.candidate(t) || rows[i] == 0 {
 			continue
 		}
-		fans := rows[i] >= eagerAggMinFanout*kept
-		if m, ok := ea.statFanout(t); ok {
-			fans = m >= eagerAggMinFanout
+		keys := float64(ea.keyBound(t, rows[i]))
+		if m, ok := ea.statFanout(t); ok && m > 0 {
+			keys = max(1, float64(rows[i])/float64(m))
 		}
-		if fans {
+		if fanout := float64(rows[i]) / keys; fanout >= eagerAggMinFanout {
 			t.pre = true
 			facts++
+			join *= fanout
+			walk *= keys
 		}
 	}
-	if facts < 2 {
+	if facts < 2 || join < walk {
 		return false
 	}
 	filtered := false
@@ -552,6 +569,56 @@ func (ea *eaState) choose() bool {
 		}
 	}
 	return true
+}
+
+// keyBound bounds how many distinct values t's key holds: its integer cells
+// counted in a bitmap over their span, plus a value for every row the delta log
+// adds; or else its rows, where the key is not a block of integers or the
+// bitmap would be larger than the column. A NULL cell counts as whatever it
+// holds, which can only add one.
+func (ea *eaState) keyBound(t *eaTable, rows int64) int64 {
+	if t.key == t.rt.ipkIndex || ea.p.segs == nil {
+		return rows
+	}
+	segs := ea.p.segs.byRoot[t.rt.root]
+	cols := make([][]int64, 0, len(segs))
+	lo, hi := int64(math.MaxInt64), int64(math.MinInt64)
+	for _, s := range segs {
+		if s.nRows == 0 {
+			continue
+		}
+		vals, ok := s.Int64Column(t.key)
+		if !ok || s.hasException(t.key) {
+			return rows
+		}
+		for _, v := range vals {
+			lo, hi = min(lo, v), max(hi, v)
+		}
+		cols = append(cols, vals)
+	}
+	_, add, ok := ea.p.segs.segDeltaCorrection(t.rt.root, segs, nil)
+	if !ok {
+		return rows
+	}
+	if lo > hi {
+		return min(rows, int64(add))
+	}
+	span := uint64(hi) - uint64(lo) + 1
+	if span == 0 || span > 64*uint64(rows) {
+		return rows
+	}
+	seen := make([]uint64, (span+63)/64)
+	for _, vals := range cols {
+		for _, v := range vals {
+			i := uint64(v) - uint64(lo)
+			seen[i/64] |= 1 << (i % 64)
+		}
+	}
+	n := int64(add)
+	for _, w := range seen {
+		n += int64(bits.OnesCount64(w))
+	}
+	return min(rows, n)
 }
 
 // statFanout returns the rows per key ANALYZE measured for t's key, from an
@@ -613,6 +680,7 @@ func (ea *eaState) rewrite(stmt *SelectStmt) *SelectStmt {
 	}
 	ea.build = true
 	out := *stmt
+	out.orderNotC = true
 	out.Columns = make([]SelectColumn, len(stmt.Columns))
 	for i, c := range stmt.Columns {
 		v, ok := ea.mapOuter(c.Expr)
@@ -670,10 +738,11 @@ func (ea *eaState) rewrite(stmt *SelectStmt) *SelectStmt {
 			cols := append([]SelectColumn{{Expr: ColumnExpr{Qualifier: t.name, Name: k}, Text: k}}, t.parts...)
 			it = FromItem{
 				Subquery: &SelectStmt{
-					Columns: cols,
-					From:    []FromItem{base},
-					Where:   andConjuncts(t.terms),
-					GroupBy: []Expr{ColumnExpr{Qualifier: t.name, Name: k}},
+					Columns:   cols,
+					From:      []FromItem{base},
+					Where:     andConjuncts(t.terms),
+					GroupBy:   []Expr{ColumnExpr{Qualifier: t.name, Name: k}},
+					orderNotC: true,
 				},
 				Alias: t.name,
 				Join:  it.Join,

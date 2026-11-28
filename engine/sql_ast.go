@@ -1250,6 +1250,12 @@ type SelectStmt struct {
 	// the copy would be unreachable. The copy shares Columns/Where/Having/GroupBy
 	// with the compound, so redirecting the pointer is enough.
 	r35dCompoundOf *SelectStmt
+
+	// orderNotC marks a statement a rewrite built (eager_agg.go) whose rows
+	// reach its aggregates in an order of its own rather than the one the
+	// statement as written would: every order-sensitive aggregate is armed
+	// (armOrderSensitive) as if its order were unproven.
+	orderNotC bool
 }
 
 // valuesFold is how sqlite3MultiValues folded a multi-row VALUES clause, which

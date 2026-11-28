@@ -9,7 +9,8 @@ import "testing"
 // BY and LIMIT over the rebuilt aggregates, three facts, and every shape the
 // rewrite refuses (sum/avg/total/group_concat, DISTINCT, FILTER, an outer
 // join, a cross-table inequality, an untyped key meeting a TEXT one, a NOCASE
-// key, a window, a selective star join, too little fan-out, a missing column).
+// key, a window, a selective star join, a missing column), and a dim larger
+// than the facts' key count.
 // The issue's own tables are scaled down to 20,000 rows.
 func TestEagerAggregateAsC(t *testing.T) {
 	stmts := []string{
@@ -102,5 +103,74 @@ func TestEagerAggregateIssueAsC(t *testing.T) {
 		`SELECT (SELECT max(cnt) FROM (SELECT d.bucket, count(*) AS cnt FROM fact_a a JOIN dim d USING (keyid) JOIN fact_b b USING (keyid) GROUP BY d.bucket)) AS v`,
 	} {
 		differ(t, "eager-agg-issue", append(append([]string{}, stmts...), q))
+	}
+}
+
+// TestEagerAggregateCollationAsC: min/max of a NOCASE or RTRIM fact column
+// compare under its collation, but their result carries none, so HAVING and
+// ORDER BY compare it under BINARY. And the per-key join reaches min/max in an
+// order of its own, so compare-equal values with different bytes (texts under
+// NOCASE, 1 and 1.0, the integer and the REAL -2^63) decline rather than take
+// whichever came first.
+func TestEagerAggregateCollationAsC(t *testing.T) {
+	stmts := []string{
+		`CREATE TABLE d(k INTEGER, g TEXT, u, n TEXT COLLATE NOCASE)`,
+		`WITH RECURSIVE g(value) AS (SELECT 0 UNION ALL SELECT value + 1 FROM g WHERE value < 19) INSERT INTO d SELECT value, 'g' || (value % 3), CASE WHEN value % 2 THEN 1 ELSE 1.0 END, CASE WHEN value % 2 THEN 'x' ELSE 'X' END FROM g`,
+		`CREATE TABLE fa(k INTEGER, x INTEGER, s TEXT COLLATE NOCASE, r TEXT COLLATE RTRIM, v, i INTEGER)`,
+		`WITH RECURSIVE g(value) AS (SELECT 0 UNION ALL SELECT value + 1 FROM g WHERE value < 399) INSERT INTO fa SELECT value % 20, value, CASE WHEN value % 20 < 7 THEN 'a' ELSE 'B' END, CASE WHEN value % 3 = 0 THEN 'b ' ELSE 'b' END, CASE WHEN value % 3 THEN 5 ELSE 5.0 END, CASE WHEN value % 3 THEN -9223372036854775808 ELSE -9223372036854775808.0 END FROM g`,
+		`CREATE TABLE fm(k INTEGER, s TEXT COLLATE NOCASE)`,
+		`WITH RECURSIVE g(value) AS (SELECT 0 UNION ALL SELECT value + 1 FROM g WHERE value < 399) INSERT INTO fm SELECT value % 20, char(CASE value % 3 WHEN 0 THEN 97 WHEN 1 THEN 65 ELSE 98 END) FROM g`,
+		`CREATE TABLE fb(k INTEGER, y)`,
+		`WITH RECURSIVE g(value) AS (SELECT 0 UNION ALL SELECT value + 1 FROM g WHERE value < 399) INSERT INTO fb SELECT value % 20, value FROM g`,
+	}
+	for _, q := range []string{
+		`SELECT d.k, min(a.s) FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.k HAVING min(a.s) < 'B'`,
+		`SELECT d.k, min(a.s) AS m FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.k HAVING m < 'B'`,
+		`SELECT d.k, min(a.s) FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.k ORDER BY min(a.s), d.k`,
+		`SELECT d.k, max(a.s) AS m FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.k ORDER BY m DESC, d.k`,
+		`SELECT d.g, max(a.s) FROM fm a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.g HAVING max(a.s) = 'B'`,
+		`SELECT d.g, max(a.s), min(a.s) FROM fm a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.g HAVING min(a.s) = 'A'`,
+		`SELECT d.g, max(a.r) FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.g HAVING max(a.r) = 'b'`,
+		`SELECT d.g, max(a.v), typeof(max(a.v)) FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.g`,
+		`SELECT d.g, min(a.i), typeof(min(a.i)) FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.g`,
+		`SELECT d.g, min(d.u), typeof(min(d.u)), count(*) FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.g`,
+		`SELECT d.u, typeof(d.u), count(*) FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.u`,
+		`SELECT d.n, count(*), max(b.y) FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.n`,
+		`SELECT d.n, count(*) FROM d JOIN fa a USING (k) JOIN fb b USING (k) GROUP BY d.n`,
+	} {
+		differ(t, "eager-agg-collation", append(append([]string{}, stmts...), q))
+	}
+}
+
+// TestEagerAggregateFanoutAsC: facts with many keys, or a key per row, over a
+// small dim are left to the join; facts with few keys are joined per key, also
+// against a dim with more rows than they have keys.
+func TestEagerAggregateFanoutAsC(t *testing.T) {
+	stmts := []string{
+		`CREATE TABLE d(k INTEGER, g TEXT)`,
+		`WITH RECURSIVE g(value) AS (SELECT 0 UNION ALL SELECT value + 1 FROM g WHERE value < 99) INSERT INTO d SELECT value * 7, 'g' || (value % 10) FROM g`,
+		`CREATE TABLE ma(k INTEGER, x INTEGER)`,
+		`WITH RECURSIVE g(value) AS (SELECT 0 UNION ALL SELECT value + 1 FROM g WHERE value < 19999) INSERT INTO ma SELECT value % 5000, value FROM g`,
+		`CREATE TABLE mb(k INTEGER, y INTEGER)`,
+		`INSERT INTO mb SELECT * FROM ma`,
+		`CREATE TABLE ua(k INTEGER, x INTEGER)`,
+		`WITH RECURSIVE g(value) AS (SELECT 0 UNION ALL SELECT value + 1 FROM g WHERE value < 19999) INSERT INTO ua SELECT value, value FROM g`,
+		`CREATE TABLE ub(k INTEGER, y INTEGER)`,
+		`INSERT INTO ub SELECT * FROM ua`,
+		`CREATE TABLE fa(k INTEGER, x INTEGER)`,
+		`WITH RECURSIVE g(value) AS (SELECT 0 UNION ALL SELECT value + 1 FROM g WHERE value < 19999) INSERT INTO fa SELECT value % 100 * 7, value FROM g`,
+		`CREATE TABLE fb(k INTEGER, y INTEGER)`,
+		`INSERT INTO fb SELECT * FROM fa`,
+		`CREATE TABLE big(k INTEGER, g TEXT)`,
+		`WITH RECURSIVE g(value) AS (SELECT 0 UNION ALL SELECT value + 1 FROM g WHERE value < 39999) INSERT INTO big SELECT value % 700, 'g' || (value % 10) FROM g`,
+	}
+	for _, q := range []string{
+		`SELECT d.g, count(*), max(b.y) FROM d JOIN ma a USING (k) JOIN mb b USING (k) GROUP BY d.g`,
+		`SELECT d.g, count(*), max(b.y) FROM ma a JOIN d USING (k) JOIN mb b USING (k) GROUP BY d.g`,
+		`SELECT d.g, count(*), max(b.y) FROM ua a JOIN d USING (k) JOIN ub b USING (k) GROUP BY d.g`,
+		`SELECT d.g, count(*), max(b.y) FROM d JOIN fa a USING (k) JOIN fb b USING (k) GROUP BY d.g`,
+		`SELECT big.g, count(*), max(b.y), min(a.x) FROM fa a JOIN big USING (k) JOIN fb b USING (k) GROUP BY big.g`,
+	} {
+		differ(t, "eager-agg-fanout", append(append([]string{}, stmts...), q))
 	}
 }
