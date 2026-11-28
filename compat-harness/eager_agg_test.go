@@ -54,6 +54,7 @@ func TestEagerAggregateAsC(t *testing.T) {
 		`SELECT d.g, max(a.x), count(*) FROM d JOIN fa a ON a.k = d.k AND a.x BETWEEN 2 AND 8 JOIN fb b ON b.k = d.k AND b.t IN ('a', 'b') GROUP BY d.g`,
 		`SELECT d.g, count(*) FROM fa a JOIN d USING (k) JOIN fb b USING (k) WHERE a.r > 100 GROUP BY d.g`,
 		`SELECT d.g, count(*) FROM fa a JOIN d ON a.k = d.k JOIN fb b ON b.k = d.h GROUP BY d.g`,
+		`SELECT d.g AS gg, count(*) AS n, max(b.y) AS m FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.g HAVING n > 1000 AND gg <> 'g1' ORDER BY m, gg`,
 		`SELECT d.h, d.g, count(*) FROM fa JOIN d ON fa.k = d.k JOIN fb ON fb.k = fa.k GROUP BY d.g`,
 		`SELECT d.g, count(*), avg(b.y) FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.g`,
 		`SELECT d.g, sum(a.x) FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.g`,
@@ -77,6 +78,7 @@ func TestEagerAggregateAsC(t *testing.T) {
 		`SELECT d.g, count(*) FROM fa a JOIN d USING (k) JOIN fb b USING (k) WHERE abs(a.x) > 2 GROUP BY d.g`,
 		`SELECT d.g, count(*) FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.g HAVING (SELECT 1)`,
 		`SELECT d.g, count(*) FROM fa a JOIN d ON a.k = d.k JOIN fb b ON b.k = a.x GROUP BY d.g`,
+		`SELECT d.g, count(*) AS n FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.g HAVING nope > 1`,
 	}
 	for _, q := range queries {
 		differ(t, "eager-agg", append(append([]string{}, stmts...), q))

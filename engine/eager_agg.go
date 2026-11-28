@@ -101,12 +101,15 @@ func (p *ReadOnlyPager) eagerAggregate(stmt *SelectStmt) *SelectStmt {
 		}
 	}
 	if stmt.Having != nil {
-		if _, ok := ea.mapOuter(stmt.Having); !ok {
+		ea.having = stmt
+		_, ok := ea.mapOuter(stmt.Having)
+		ea.having = nil
+		if !ok {
 			return nil
 		}
 	}
 	for _, ot := range stmt.OrderBy {
-		if ea.orderByAlias(stmt, ot.Expr) {
+		if ea.namesAlias(stmt, ot.Expr) {
 			continue
 		}
 		if _, ok := ea.mapOuter(ot.Expr); !ok {
@@ -145,6 +148,9 @@ type eaState struct {
 	on    [][]Expr
 	// build is set for mapOuter's second pass, which rebuilds the aggregates.
 	build bool
+	// having is the statement while its HAVING is mapped, whose aliases a
+	// name there may be.
+	having *SelectStmt
 }
 
 type eaTable struct {
@@ -325,9 +331,10 @@ func (ea *eaState) link(x, y [2]int) {
 	}
 }
 
-// orderByAlias reports an ORDER BY term naming a result column's alias, which
-// C resolves to that column before any table's (resolveAsName).
-func (ea *eaState) orderByAlias(stmt *SelectStmt, e Expr) bool {
+// namesAlias reports a bare name that is a result column's alias. C resolves
+// an ORDER BY term to it before any table's column (resolveAsName), and a
+// HAVING name to it when no table has the column (lookupName).
+func (ea *eaState) namesAlias(stmt *SelectStmt, e Expr) bool {
 	c, ok := e.(ColumnExpr)
 	if !ok || c.Qualifier != "" || c.Schema != "" {
 		return false
@@ -349,6 +356,9 @@ func (ea *eaState) mapOuter(e Expr) (Expr, bool) {
 		return e, true
 	case ColumnExpr:
 		t, col, ok := ea.resolve(x)
+		if !ok && ea.having != nil {
+			return e, ea.namesAlias(ea.having, x)
+		}
 		return e, ok && ea.group[[2]int{t, col}]
 	case UnaryExpr:
 		v, ok := ea.mapOuter(x.X)
@@ -581,7 +591,9 @@ func (ea *eaState) rewrite(stmt *SelectStmt) *SelectStmt {
 		out.Columns[i] = c
 	}
 	if stmt.Having != nil {
+		ea.having = stmt
 		v, ok := ea.mapOuter(stmt.Having)
+		ea.having = nil
 		if !ok {
 			return nil
 		}
@@ -590,7 +602,7 @@ func (ea *eaState) rewrite(stmt *SelectStmt) *SelectStmt {
 	if len(stmt.OrderBy) != 0 {
 		out.OrderBy = make([]OrderTerm, len(stmt.OrderBy))
 		for i, ot := range stmt.OrderBy {
-			if !ea.orderByAlias(stmt, ot.Expr) {
+			if !ea.namesAlias(stmt, ot.Expr) {
 				v, ok := ea.mapOuter(ot.Expr)
 				if !ok {
 					return nil
