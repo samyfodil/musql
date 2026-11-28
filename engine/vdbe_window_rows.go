@@ -126,7 +126,7 @@ func (r *windowRows) cell(v Value) winCell {
 	switch {
 	case v.S == nil:
 		c.a, c.b = uint64(v.I), fb
-	case len(v.S) > math.MaxUint32 || (v.I != 0 && fb != 0):
+	case uint64(len(v.S)) > math.MaxUint32 || (v.I != 0 && fb != 0):
 		c.flags = winEscaped
 		c.a = uint64(len(r.esc))
 		r.esc = append(r.esc, copyValue(v))
