@@ -1308,7 +1308,17 @@ func (m *vdbe) windowAggregate(plan *windowPlan, call windowCall, ci int, part [
 	// removal step to make. The frames C inverts rows out of are the exception
 	// (windowIncrementalAggregate).
 	// A deliberate simplification: O(n^2) per partition, revisit if window queries get hot.
+	//
+	// Without EXCLUDE a frame is its span alone, and every step reads only the
+	// row it steps, so a row whose span is the previous row's would step the
+	// same rows in the same order: it takes that row's value. Every row of an
+	// OVER () partition, or of one peer group in a RANGE frame, is such a row.
+	sameRows := call.spec.Frame == nil || !call.spec.Frame.Exclude
 	for k := range part {
+		if sameRows && k > 0 && spans[k].lo == spans[k-1].lo && spans[k].hi == spans[k-1].hi {
+			vals[part[k]][ci] = vals[part[k-1]][ci]
+			continue
+		}
 		acc := cloneAggTemplates([]*aggItem{tmpl})[0]
 		for j := spans[k].lo; j < spans[k].hi; j++ {
 			if !frameRowIncluded(spans[k], call.spec.Frame, k, j) {
