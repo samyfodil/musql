@@ -749,20 +749,22 @@ func (p *windowProjection) machine(m *vdbe) *vdbe {
 	return pm
 }
 
-// run seeds pm's registers from one batch entry and its window values, runs
-// the program and returns the projected values. Registers are cleared first so
-// no value from a previous row is ever readable.
-func (p *windowProjection) run(pm *vdbe, entry, winVals []Value) ([]Value, error) {
+// run seeds pm's registers from batch row ri and its window values, runs the
+// program and returns the projected values in out, or in a slice of their own
+// when out is nil. Registers are cleared first so no value from a previous row
+// is ever readable.
+func (p *windowProjection) run(pm *vdbe, batch *windowRows, ri int, winVals, out []Value) ([]Value, error) {
 	clear(pm.regs)
+	w := batch.width(ri)
 	// The batch entry's trailing rowid block, one slot per joined table
 	// (compileScanWindow emits one OpRowid per source into it). Bounded by what
 	// the entry actually carries, since a shorter entry must leave the tail
 	// registers at the NULL the clear above put there.
-	if n := min(p.nRowids, len(entry)-p.nCols); n > 0 {
-		copy(pm.regs[p.rowidReg:p.rowidReg+n], entry[p.nCols:p.nCols+n])
+	for i := range min(p.nRowids, w-p.nCols) {
+		pm.regs[p.rowidReg+i] = batch.at(ri, p.nCols+i)
 	}
-	if p.nCols > 0 {
-		copy(pm.regs[p.colBase:p.colBase+p.nCols], entry)
+	for i := range min(p.nCols, w) {
+		pm.regs[p.colBase+i] = batch.at(ri, i)
 	}
 	// The entry's OPERAND tail, whose leading len(bufRegs) columns are the
 	// references this projection buffered (planWindowOperands puts them
@@ -770,15 +772,17 @@ func (p *windowProjection) run(pm *vdbe, entry, winVals []Value) ([]Value, error
 	// the compile discovers each reference, so they are not contiguous.
 	// Bounded by the entry like the rowid block above.
 	for i, r := range p.bufRegs {
-		if j := p.nCols + p.nRowids + i; j < len(entry) {
-			pm.regs[r] = entry[j]
+		if j := p.nCols + p.nRowids + i; j < w {
+			pm.regs[r] = batch.at(ri, j)
 		}
 	}
 	copy(pm.regs[p.winBase:p.winBase+p.nWin], winVals)
 	if _, err := pm.run(p.prog.Insns); err != nil {
 		return nil, err
 	}
-	out := make([]Value, len(p.resultReg))
+	if out == nil {
+		out = make([]Value, len(p.resultReg))
+	}
 	for i, r := range p.resultReg {
 		out[i] = pm.regs[r]
 	}

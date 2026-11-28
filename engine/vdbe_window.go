@@ -274,12 +274,12 @@ func rewriteWindowCalls(e Expr, calls *[]windowCall) Expr {
 // (planWindowOperands, emitWindowOperands). Out of range is an error, never a
 // panic: every operand column is written for every row, so a short entry is
 // an internal inconsistency.
-func (m *vdbe) windowOperand(plan *windowPlan, entry []Value, col int) (Value, error) {
+func (m *vdbe) windowOperand(plan *windowPlan, batch *windowRows, ri, col int) (Value, error) {
 	i := plan.nCols + plan.nRowids + col
-	if col < 0 || i < 0 || i >= len(entry) {
-		return Value{}, fmt.Errorf("vdbe: window operand column %d is outside a %d-value batch entry", col, len(entry))
+	if w := batch.width(ri); col < 0 || i < 0 || i >= w {
+		return Value{}, fmt.Errorf("vdbe: window operand column %d is outside a %d-value batch entry", col, w)
 	}
-	return entry[i], nil
+	return batch.at(ri, i), nil
 }
 
 // windowRowCtx builds the evalCtx for one batch entry, splitting it into its
@@ -299,12 +299,43 @@ func (p *windowPlan) windowRowCtx(m *vdbe, entry []Value, winVals []Value) *eval
 	}
 }
 
+// windowRowCtxs hands out windowRowCtx for batch rows one at a time. One
+// context and one decoded row serve every row, since a step reads its row
+// context only while it runs -- except an aggregate with an ORDER BY, whose
+// buffer keeps the first row's context for the replay at finalize
+// (aggItem.obBuffer): that one gets a context and a row of its own each time.
+type windowRowCtxs struct {
+	m     *vdbe
+	plan  *windowPlan
+	batch *windowRows
+	vals  [][]Value
+	fresh bool
+	ctx   *evalCtx
+	buf   []Value
+}
+
+func (w *windowRowCtxs) at(ri int) *evalCtx {
+	p := w.plan
+	if w.fresh {
+		return p.windowRowCtx(w.m, w.batch.row(ri), w.vals[ri])
+	}
+	entry := w.batch.rowInto(ri, 0, &w.buf)
+	if w.ctx == nil {
+		w.ctx = p.windowRowCtx(w.m, entry, w.vals[ri])
+		return w.ctx
+	}
+	w.ctx.vals = entry[:p.nCols]
+	w.ctx.rowids = entry[p.nCols : p.nCols+p.nRowids]
+	w.ctx.windowVals = w.vals[ri]
+	return w.ctx
+}
+
 // projectWindowRow computes one batch row's projection (plan.projExprs: the
 // outer select list, then each ORDER BY term that is not an output ordinal) by
 // running the compiled program. compileWindowProjection is total, so there is
 // always one.
-func (m *vdbe) projectWindowRow(plan *windowPlan, pm *vdbe, entry, winVals []Value) ([]Value, error) {
-	return plan.proj.run(pm, entry, winVals)
+func (m *vdbe) projectWindowRow(plan *windowPlan, pm *vdbe, batch *windowRows, ri int, winVals []Value) ([]Value, error) {
+	return plan.proj.run(pm, batch, ri, winVals, m.recAlloc(len(plan.proj.resultReg)))
 }
 
 // windowFinal resolves the collected batch into the query's result rows.
@@ -362,8 +393,8 @@ func windowLevels(calls []windowCall) []int {
 // (sqlite3WindowCompare) opens two; that is sound because stable sorts by K,
 // anything, then K again equal one sort by K over the middle. Each call still
 // uses its own frame.
-func (m *vdbe) computeWindowLevels(plan *windowPlan, batch [][]Value, vals [][]Value) ([]int, error) {
-	order := make([]int, len(batch))
+func (m *vdbe) computeWindowLevels(plan *windowPlan, batch *windowRows, vals [][]Value) ([]int, error) {
+	order := make([]int, batch.len())
 	for i := range order {
 		order[i] = i
 	}
@@ -403,11 +434,11 @@ func (m *vdbe) computeWindowLevels(plan *windowPlan, batch [][]Value, vals [][]V
 		if perr := m.sortPartitionsByKey(plan, lvl, parts, batch, vals); perr != nil {
 			return nil, perr
 		}
-		next := make([]int, 0, len(batch))
+		next := make([]int, 0, batch.len())
 		for _, part := range parts {
 			next = append(next, part...)
 		}
-		if len(next) != len(batch) {
+		if len(next) != batch.len() {
 			return nil, fmt.Errorf("%w: window partitioning lost rows", errVDBEUnsupported) // defensive: never emit a partial batch
 		}
 		order = next
@@ -419,7 +450,7 @@ func (m *vdbe) computeWindowLevels(plan *windowPlan, batch [][]Value, vals [][]V
 // ascending under each key expression's collating sequence -- see
 // computeWindowLevels, which is the only caller (the VALUES a window computes
 // never depend on partition order, only the emitted ROW order does).
-func (m *vdbe) sortPartitionsByKey(plan *windowPlan, lvl windowCall, parts [][]int, batch, vals [][]Value) error {
+func (m *vdbe) sortPartitionsByKey(plan *windowPlan, lvl windowCall, parts [][]int, batch *windowRows, vals [][]Value) error {
 	spec := lvl.spec
 	if spec == nil || len(spec.PartitionBy) == 0 || len(parts) < 2 {
 		return nil
@@ -430,7 +461,7 @@ func (m *vdbe) sortPartitionsByKey(plan *windowPlan, lvl windowCall, parts [][]i
 		ri := part[0] // every row of a partition shares its key by construction
 		k := make([]Value, len(spec.PartitionBy))
 		for j := range spec.PartitionBy {
-			v, err := m.windowOperand(plan, batch[ri], lvl.partCol(j))
+			v, err := m.windowOperand(plan, batch, ri, lvl.partCol(j))
 			if err != nil {
 				return err
 			}
@@ -497,11 +528,16 @@ func (e *windowTailErr) Unwrap() error { return e.err }
 
 func (m *vdbe) windowFinal(plan *windowPlan) ([][]Value, error) {
 	batch := m.windowBatch
+	if batch == nil {
+		batch = &windowRows{}
+	}
 	m.windowLazyErr = nil
-	n := len(batch)
+	n := batch.len()
 	vals := make([][]Value, n) // vals[row][call]
+	nc := len(plan.calls)
+	flat := make([]Value, n*nc)
 	for i := range vals {
-		vals[i] = make([]Value, len(plan.calls))
+		vals[i] = flat[i*nc : (i+1)*nc : (i+1)*nc]
 	}
 
 	// C SQLite emits rows in the WINDOW's own sort order -- it computes the
@@ -526,8 +562,7 @@ func (m *vdbe) windowFinal(plan *windowPlan) ([][]Value, error) {
 	rows := make([]outRow, 0, n)
 	pm := plan.proj.machine(m)
 	for _, i := range emitOrder {
-		entry := batch[i]
-		proj, err := m.projectWindowRow(plan, pm, entry, vals[i])
+		proj, err := m.projectWindowRow(plan, pm, batch, i, vals[i])
 		if err != nil {
 			return nil, err
 		}
@@ -817,11 +852,11 @@ func outputAliasIndex(outCols []outputColumn, e Expr) int {
 // sequence. An ordinal term ("ORDER BY 2") takes the collation of the OUTPUT
 // expression it names -- exactly what an ordinary ORDER BY does -- and any
 // other term is resolved as written. Resolved once against any row's scope.
-func (m *vdbe) outerOrderCollations(plan *windowPlan, batch [][]Value, vals [][]Value) []string {
-	if len(plan.orderTerms) == 0 || len(batch) == 0 {
+func (m *vdbe) outerOrderCollations(plan *windowPlan, batch *windowRows, vals [][]Value) []string {
+	if len(plan.orderTerms) == 0 || batch.len() == 0 {
 		return nil
 	}
-	ctx := plan.windowRowCtx(m, batch[0], vals[0])
+	ctx := plan.windowRowCtx(m, batch.row(0), vals[0])
 	out := make([]string, len(plan.orderTerms))
 	for i, ot := range plan.orderTerms {
 		e := ot.Expr
@@ -854,7 +889,7 @@ func (m *vdbe) outerOrderCollations(plan *windowPlan, batch [][]Value, vals [][]
 // computeWindowLevels. Both sorts here are STABLE, so that incoming order is
 // what breaks a tie under this spec's own keys, exactly as it does for real
 // SQLite's nested sub-selects.
-func (m *vdbe) partitionAndOrder(plan *windowPlan, lvl windowCall, batch [][]Value, vals [][]Value, order []int) ([][]int, error) {
+func (m *vdbe) partitionAndOrder(plan *windowPlan, lvl windowCall, batch *windowRows, vals [][]Value, order []int) ([][]int, error) {
 	spec := lvl.spec
 	if spec == nil {
 		spec = &WindowSpec{}
@@ -865,7 +900,7 @@ func (m *vdbe) partitionAndOrder(plan *windowPlan, lvl windowCall, batch [][]Val
 		}
 		k := make([]Value, len(exprs))
 		for j := range exprs {
-			v, err := m.windowOperand(plan, batch[i], atCol(cols, j))
+			v, err := m.windowOperand(plan, batch, i, atCol(cols, j))
 			if err != nil {
 				return nil, err
 			}
@@ -918,7 +953,7 @@ func (m *vdbe) partitionAndOrder(plan *windowPlan, lvl windowCall, batch [][]Val
 			ks = ks[:0]
 			for at, i := range part {
 				for j := range nk {
-					v, err := m.windowOperand(plan, batch[i], atCol(lvl.orderCols, j))
+					v, err := m.windowOperand(plan, batch, i, atCol(lvl.orderCols, j))
 					if err != nil {
 						return nil, err
 					}
@@ -966,11 +1001,11 @@ func (m *vdbe) partitionAndOrder(plan *windowPlan, lvl windowCall, batch [][]Val
 // sequence, resolved once against any row's scope (they are all the same
 // scope). A nil/empty result degrades every comparison to BINARY, the previous
 // behavior.
-func (m *vdbe) windowKeyCollations(plan *windowPlan, exprs []Expr, batch [][]Value, vals [][]Value) []string {
-	if len(exprs) == 0 || len(batch) == 0 {
+func (m *vdbe) windowKeyCollations(plan *windowPlan, exprs []Expr, batch *windowRows, vals [][]Value) []string {
+	if len(exprs) == 0 || batch.len() == 0 {
 		return nil
 	}
-	ctx := plan.windowRowCtx(m, batch[0], vals[0])
+	ctx := plan.windowRowCtx(m, batch.row(0), vals[0])
 	out := make([]string, len(exprs))
 	for i, e := range exprs {
 		if name, ok := topExprCollation(ctx, e); ok {
@@ -985,7 +1020,7 @@ func (m *vdbe) windowKeyCollations(plan *windowPlan, exprs []Expr, batch [][]Val
 // window's ORDER BY. With no ORDER BY every row is a peer of every other, so
 // the whole partition is one group -- which is exactly what makes a frameless
 // aggregate window span the entire partition.
-func (m *vdbe) windowPeerEnds(plan *windowPlan, call windowCall, part []int, batch [][]Value, vals [][]Value) ([]int, error) {
+func (m *vdbe) windowPeerEnds(plan *windowPlan, call windowCall, part []int, batch *windowRows, vals [][]Value) ([]int, error) {
 	spec := call.spec
 	np := len(part)
 	ends := make([]int, np)
@@ -1003,10 +1038,12 @@ func (m *vdbe) windowPeerEnds(plan *windowPlan, call windowCall, part []int, bat
 	// ordering itself (see partitionAndOrder).
 	colls := m.windowKeyCollations(plan, orderExprs, batch, vals)
 	keys := make([][]Value, np)
+	nk := len(spec.OrderBy)
+	flat := make([]Value, np*nk)
 	for i, ri := range part {
-		k := make([]Value, len(spec.OrderBy))
+		k := flat[i*nk : (i+1)*nk : (i+1)*nk]
 		for j := range spec.OrderBy {
-			v, err := m.windowOperand(plan, batch[ri], call.orderCol(j))
+			v, err := m.windowOperand(plan, batch, ri, call.orderCol(j))
 			if err != nil {
 				return nil, err
 			}
@@ -1089,7 +1126,7 @@ func clearWindowCallSubtype(name string, ci int, parts [][]int, vals [][]Value) 
 // computeWindowCall fills vals[row][ci] for every row, per call's function.
 // parts is this call's LEVEL's partitioning (computeWindowLevels): every call
 // sharing one specification shares one partition/order pass.
-func (m *vdbe) computeWindowCall(plan *windowPlan, call windowCall, ci int, parts [][]int, batch [][]Value, vals [][]Value, peerAmbiguous bool) error {
+func (m *vdbe) computeWindowCall(plan *windowPlan, call windowCall, ci int, parts [][]int, batch *windowRows, vals [][]Value, peerAmbiguous bool) error {
 	if err := checkWindowFuncArity(call.name, call.written, len(call.args)); err != nil {
 		return err
 	}
@@ -1197,7 +1234,7 @@ func (m *vdbe) computeWindowCall(plan *windowPlan, call windowCall, ci int, part
 
 // windowAggregate computes an aggregate window function over each row's own
 // FRAME (spans, from windowFrameSpans) for one ordered partition.
-func (m *vdbe) windowAggregate(plan *windowPlan, call windowCall, ci int, part []int, spans []windowFrameSpan, batch [][]Value, vals [][]Value, peerAmbiguous bool) error {
+func (m *vdbe) windowAggregate(plan *windowPlan, call windowCall, ci int, part []int, spans []windowFrameSpan, batch *windowRows, vals [][]Value, peerAmbiguous bool) error {
 	fc := call.funcExpr()
 	if !isAggregateCall(fc) {
 		return fmt.Errorf("%w: window function %s()", errVDBEUnsupported, call.name)
@@ -1235,7 +1272,10 @@ func (m *vdbe) windowAggregate(plan *windowPlan, call windowCall, ci int, part [
 	var (
 		stepPM   *vdbe
 		stepRegs []Value
+		opBuf    []Value
+		argBuf   []Value
 	)
+	rows := windowRowCtxs{m: m, plan: plan, batch: batch, vals: vals, fresh: tmpl.orderBy != nil}
 	if call.stepArgs != nil {
 		stepPM = call.stepArgs.machine(m)
 		stampWindowStepArgRegs(tmpl, plan, call)
@@ -1243,7 +1283,7 @@ func (m *vdbe) windowAggregate(plan *windowPlan, call windowCall, ci int, part [
 	// regsFor is one row's argument registers for a step (or an inverse), or
 	// skip when its FILTER rules it out before any argument is coded.
 	regsFor := func(ri int) (regs []Value, skip bool, err error) {
-		regs = plan.operandVals(batch[ri])
+		regs = batch.rowInto(ri, plan.nCols+plan.nRowids, &opBuf)
 		if stepPM != nil {
 			// C's windowAggStep tests the BUFFERED filter column first and
 			// its OP_IfNot jumps past the whole argument coding
@@ -1252,7 +1292,7 @@ func (m *vdbe) windowAggregate(plan *windowPlan, call windowCall, ci int, part [
 			// the row entirely is the same thing: aggItem.step reads the
 			// very same column and would skip it too.
 			if call.filterCol >= 0 {
-				fv, ferr := m.windowOperand(plan, batch[ri], call.filterCol)
+				fv, ferr := m.windowOperand(plan, batch, ri, call.filterCol)
 				if ferr != nil {
 					return nil, false, ferr
 				}
@@ -1260,7 +1300,8 @@ func (m *vdbe) windowAggregate(plan *windowPlan, call windowCall, ci int, part [
 					return nil, true, nil
 				}
 			}
-			av, aerr := call.stepArgs.run(stepPM, batch[ri], nil)
+			argBuf = growValues(&argBuf, len(call.stepArgs.resultReg))
+			av, aerr := call.stepArgs.run(stepPM, batch, ri, nil, argBuf)
 			if aerr != nil {
 				return nil, false, aerr
 			}
@@ -1270,7 +1311,7 @@ func (m *vdbe) windowAggregate(plan *windowPlan, call windowCall, ci int, part [
 		return regs, false, nil
 	}
 	if windowIncrementalEligible(call, tmpl, spans) {
-		return m.windowIncrementalAggregate(plan, call, ci, part, spans, batch, vals, tmpl, regsFor)
+		return m.windowIncrementalAggregate(call, ci, part, spans, &rows, vals, tmpl, regsFor)
 	}
 	if windowRunningEligible(call, tmpl, spans) {
 		// A frame that starts at UNBOUNDED PRECEDING only ever grows: C steps
@@ -1289,7 +1330,7 @@ func (m *vdbe) windowAggregate(plan *windowPlan, call windowCall, ci int, part [
 				if skip {
 					continue
 				}
-				if err := acc.step(plan.windowRowCtx(m, batch[ri], vals[ri]), regs); err != nil {
+				if err := acc.step(rows.at(ri), regs); err != nil {
 					return err
 				}
 			}
@@ -1332,8 +1373,7 @@ func (m *vdbe) windowAggregate(plan *windowPlan, call windowCall, ci int, part [
 			if skip {
 				continue
 			}
-			ctx := plan.windowRowCtx(m, batch[ri], vals[ri])
-			if err := acc.step(ctx, regs); err != nil {
+			if err := acc.step(rows.at(ri), regs); err != nil {
 				return err
 			}
 		}
@@ -1349,7 +1389,7 @@ func (m *vdbe) windowAggregate(plan *windowPlan, call windowCall, ci int, part [
 // windowIncrementalAggregate runs a moving-frame aggregate as C does: one
 // accumulator for the partition, rows stepped in as the frame's end passes them
 // and inverted out as its start does, the row read after each move.
-func (m *vdbe) windowIncrementalAggregate(plan *windowPlan, call windowCall, ci int, part []int, spans []windowFrameSpan, batch, vals [][]Value, tmpl *aggItem, regsFor func(int) ([]Value, bool, error)) error {
+func (m *vdbe) windowIncrementalAggregate(call windowCall, ci int, part []int, spans []windowFrameSpan, rows *windowRowCtxs, vals [][]Value, tmpl *aggItem, regsFor func(int) ([]Value, bool, error)) error {
 	acc := cloneAggTemplates([]*aggItem{tmpl})[0]
 	var gc groupConcatWindow
 	stepRow := func(ri int) error {
@@ -1357,7 +1397,7 @@ func (m *vdbe) windowIncrementalAggregate(plan *windowPlan, call windowCall, ci 
 		if err != nil || skip {
 			return err
 		}
-		ctx := plan.windowRowCtx(m, batch[ri], vals[ri])
+		ctx := rows.at(ri)
 		if tmpl.kind != aggGroupConcat {
 			return acc.step(ctx, regs)
 		}
@@ -1373,7 +1413,7 @@ func (m *vdbe) windowIncrementalAggregate(plan *windowPlan, call windowCall, ci 
 		if err != nil || skip {
 			return err
 		}
-		ctx := plan.windowRowCtx(m, batch[ri], vals[ri])
+		ctx := rows.at(ri)
 		if tmpl.kind != aggGroupConcat {
 			return acc.inverse(ctx, regs)
 		}
@@ -1493,13 +1533,6 @@ func stampWindowStepArgRegs(tmpl *aggItem, plan *windowPlan, call windowCall) {
 // operandVals is one batch entry's OPERAND block -- the columns
 // planWindowOperands appended after the [cols.., rowids..] payload, indexed by
 // the same operand column number vdbe.windowOperand reads.
-func (p *windowPlan) operandVals(entry []Value) []Value {
-	base := p.nCols + p.nRowids
-	if base >= len(entry) {
-		return nil
-	}
-	return entry[base:]
-}
 
 // compileNoFromWindow compiles a FROM-less window SELECT ("SELECT sum(44) OVER
 // ()", or the correlated inner query of "SELECT (SELECT sum(a) OVER (ORDER BY
@@ -1942,7 +1975,6 @@ func compileScanWindow(c *compiler, stmt *SelectStmt, srcs []joinSource, scopes 
 	colBase := c.allocN(plan.nCols)
 	rowidBase := c.allocN(len(srcs))
 	opBase := c.allocN(plan.nOps)
-	recReg := c.allocRec()
 
 	jplan := joinPushdownPlan(c, srcs, scopes, stmt.Where)
 	if len(jplan.buckets) == 1 {
@@ -1981,8 +2013,7 @@ func compileScanWindow(c *compiler, stmt *SelectStmt, srcs []joinSource, scopes 
 		if operr := emitWindowOperands(c, opBase, opExprs, plan); operr != nil {
 			return operr
 		}
-		c.emit(Instruction{Op: OpMakeRecord, P1: colBase, P2: plan.nCols + len(srcs) + plan.nOps, P3: recReg})
-		c.emit(Instruction{Op: OpWindowAppend, P1: recReg})
+		c.emit(Instruction{Op: OpWindowAppend, P1: colBase, P2: plan.nCols + len(srcs) + plan.nOps})
 		for _, j := range whereJumps {
 			c.patch(j, c.here())
 		}

@@ -233,7 +233,7 @@ type vdbe struct {
 	// WINDOW-function query's scan produced (OpWindowAppend), resolved all at
 	// once by OpWindowFinal (vdbe_window.go). nil for a program with no
 	// window function.
-	windowBatch [][]Value
+	windowBatch *windowRows
 	// windowLazyErr holds, per windowBatch row, an error C raises only when
 	// that row is returned by the window code (an invalid nth_value N), for
 	// windowFinal to raise if the row is reached.
@@ -2363,7 +2363,10 @@ func (m *vdbe) runLoop(insns []Instruction) (rows [][]Value, err error) {
 			m.regs[op.P2] = v
 
 		case OpWindowAppend:
-			m.windowBatch = append(m.windowBatch, m.recRegs[op.P1])
+			if m.windowBatch == nil {
+				m.windowBatch = &windowRows{}
+			}
+			m.windowBatch.appendRow(m.regs[op.P1 : op.P1+op.P2])
 
 		case OpWindowFinal:
 			extra, werr := m.windowFinal(op.P4.(*windowPlan))

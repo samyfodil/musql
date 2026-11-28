@@ -17,7 +17,7 @@ func TestWindowOperandTakesNoExpr(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(b), "func (m *vdbe) windowOperand(plan *windowPlan, entry []Value, col int) (Value, error)") {
+	if !strings.Contains(string(b), "func (m *vdbe) windowOperand(plan *windowPlan, batch *windowRows, ri, col int) (Value, error)") {
 		t.Error("windowOperand's signature changed -- it must take no Expr, so it cannot evaluate one")
 	}
 }

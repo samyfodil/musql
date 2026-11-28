@@ -108,7 +108,7 @@ func checkWindowFrame(spec *WindowSpec) error {
 // A nil frame is SQLite's default -- RANGE BETWEEN UNBOUNDED PRECEDING AND
 // CURRENT ROW, i.e. through the current row's last peer -- which is exactly
 // what this engine computed before frames existed.
-func (m *vdbe) windowFrameSpans(plan *windowPlan, call windowCall, part, ends []int, batch, vals [][]Value) ([]windowFrameSpan, error) {
+func (m *vdbe) windowFrameSpans(plan *windowPlan, call windowCall, part, ends []int, batch *windowRows, vals [][]Value) ([]windowFrameSpan, error) {
 	spec := call.spec
 	np := len(part)
 	starts := peerStarts(ends)
@@ -346,12 +346,12 @@ func frameOffsetNumeric(v Value) (Value, bool) {
 // value a has in the partition's first row (verified). The argument was
 // computed for EVERY row on the way into the batch, exactly as SQLite computes
 // it for every row of its sub-select (window.c:1047); only this one is read.
-func (m *vdbe) partitionArgValue(plan *windowPlan, call windowCall, i int, batch, vals [][]Value, part []int) (Value, error) {
+func (m *vdbe) partitionArgValue(plan *windowPlan, call windowCall, i int, batch *windowRows, vals [][]Value, part []int) (Value, error) {
 	if len(part) == 0 {
 		return Value{Typ: Null}, nil
 	}
 	ri := part[0]
-	return m.windowOperand(plan, batch[ri], call.argCol(i))
+	return m.windowOperand(plan, batch, ri, call.argCol(i))
 }
 
 // frameIntValue extracts a whole-number offset from v, accepting the INTEGER
@@ -390,7 +390,7 @@ func frameEndWord(isStart bool) string {
 // The offset arithmetic uses this engine's "+"/"-", inheriting numeric
 // affinity; a non-numeric offset is "frame starting offset must be a
 // non-negative number" (number, not integer as for ROWS/GROUPS).
-func (m *vdbe) rangeFrameSpans(plan *windowPlan, call windowCall, part, starts, ends []int, batch, vals [][]Value, spans []windowFrameSpan) error {
+func (m *vdbe) rangeFrameSpans(plan *windowPlan, call windowCall, part, starts, ends []int, batch *windowRows, vals [][]Value, spans []windowFrameSpan) error {
 	spec := call.spec
 	np := len(part)
 	f := spec.Frame
@@ -410,7 +410,7 @@ func (m *vdbe) rangeFrameSpans(plan *windowPlan, call windowCall, part, starts, 
 		r.coll = names[0]
 	}
 	for i, ri := range part {
-		v, err := m.windowOperand(plan, batch[ri], call.orderCol(0))
+		v, err := m.windowOperand(plan, batch, ri, call.orderCol(0))
 		if err != nil {
 			return err
 		}
@@ -692,7 +692,7 @@ func (m *vdbe) frameRangeOffset(reg int, isStart bool) (Value, error) {
 // 3 4 (sizes 2,2,1,1), and ntile(10) -> 1..6 (a group per row, never an empty
 // one). N must be a positive integer -- ntile(0) and ntile(NULL) are both real
 // SQLite's "argument of ntile must be a positive integer".
-func (m *vdbe) windowNtile(plan *windowPlan, call windowCall, ci int, part []int, batch, vals [][]Value) error {
+func (m *vdbe) windowNtile(plan *windowPlan, call windowCall, ci int, part []int, batch *windowRows, vals [][]Value) error {
 	if len(part) == 0 {
 		return nil
 	}
@@ -732,7 +732,7 @@ func (m *vdbe) windowNtile(plan *windowPlan, call windowCall, ci int, part []int
 // outside it. The frame is ignored. Verified: lead(b) -> B C D E F NULL,
 // lag(b,2,'z') -> z z A B C D, and an offset of 0 yields the row's own value
 // while a NEGATIVE offset simply reverses the direction (lead(b,-1) == lag(b)).
-func (m *vdbe) windowLeadLag(plan *windowPlan, call windowCall, ci int, part []int, batch, vals [][]Value) error {
+func (m *vdbe) windowLeadLag(plan *windowPlan, call windowCall, ci int, part []int, batch *windowRows, vals [][]Value) error {
 	dir := int64(1)
 	if call.name == "lag" {
 		dir = -1
@@ -746,7 +746,7 @@ func (m *vdbe) windowLeadLag(plan *windowPlan, call windowCall, ci int, part []i
 		off := int64(1)
 		offOK := true
 		if len(call.args) > 1 {
-			v, err := m.windowOperand(plan, batch[ri], call.argCol(1))
+			v, err := m.windowOperand(plan, batch, ri, call.argCol(1))
 			if err != nil {
 				return err
 			}
@@ -781,7 +781,7 @@ func (m *vdbe) windowLeadLag(plan *windowPlan, call windowCall, ci int, part []i
 		}
 		if offOK && j >= 0 && j <= visible {
 			src := part[j]
-			v, err := m.windowOperand(plan, batch[src], call.argCol(0))
+			v, err := m.windowOperand(plan, batch, src, call.argCol(0))
 			if err != nil {
 				return err
 			}
@@ -790,7 +790,7 @@ func (m *vdbe) windowLeadLag(plan *windowPlan, call windowCall, ci int, part []i
 		}
 		def := Value{Typ: Null}
 		if len(call.args) > 2 {
-			v, err := m.windowOperand(plan, batch[ri], call.argCol(2))
+			v, err := m.windowOperand(plan, batch, ri, call.argCol(2))
 			if err != nil {
 				return err
 			}
@@ -809,7 +809,7 @@ func (m *vdbe) windowLeadLag(plan *windowPlan, call windowCall, ci int, part []i
 // nth_value(b,2) OVER (... UNBOUNDED PRECEDING AND CURRENT ROW) -> NULL B B B
 // B B. nth_value's N must be a positive integer: C SQLite's "second
 // argument to nth_value must be a positive integer".
-func (m *vdbe) windowFrameValue(plan *windowPlan, call windowCall, ci int, part []int, spans []windowFrameSpan, batch, vals [][]Value) error {
+func (m *vdbe) windowFrameValue(plan *windowPlan, call windowCall, ci int, part []int, spans []windowFrameSpan, batch *windowRows, vals [][]Value) error {
 	for k, ri := range part {
 		// nth_value's N is evaluated at the CURRENT row, not once per
 		// partition: "nth_value(b,b+1) OVER (ORDER BY b,a RANGE BETWEEN
@@ -817,7 +817,7 @@ func (m *vdbe) windowFrameValue(plan *windowPlan, call windowCall, ci int, part 
 		// window3.test, which is what caught this).
 		nth := int64(1)
 		if call.name == "nth_value" {
-			v, err := m.windowOperand(plan, batch[ri], call.argCol(1))
+			v, err := m.windowOperand(plan, batch, ri, call.argCol(1))
 			if err != nil {
 				return err
 			}
@@ -874,7 +874,7 @@ func (m *vdbe) windowFrameValue(plan *windowPlan, call windowCall, ci int, part 
 			continue
 		}
 		src := part[chosen]
-		v, err := m.windowOperand(plan, batch[src], call.argCol(0))
+		v, err := m.windowOperand(plan, batch, src, call.argCol(0))
 		if err != nil {
 			return err
 		}
