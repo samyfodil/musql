@@ -397,7 +397,8 @@ func (p *ReadOnlyPager) segListSeekIndex(cur *vdbeCursor, into *segRowSource) (s
 
 // sortListBy puts a list seek's rows in key's order, reporting false, having
 // moved nothing, when a key value is not an INTEGER (the seek then builds its
-// rows and sorts them, autoIndexOrderCursor) or key has more than 64 columns.
+// rows and sorts them, autoIndexOrderCursor), a key column is an expression,
+// or key has more than 64 columns.
 // Ties keep their rowid order, as the index's own does. A list already in
 // order -- an equality seek whose key is its own column, ties in rowid order --
 // is left as it is.
@@ -409,7 +410,8 @@ func (src *segRowSource) sortListBy(key *autoIndexKey, pinned func(c int) bool) 
 	if key == nil || n < 2 {
 		return true
 	}
-	if len(key.cols) > 64 {
+	// An expression's value is not in the row; a multi-OR order is no one key.
+	if len(key.cols) > 64 || key.multiOr != nil || slices.Contains(key.cols, xnExpr) {
 		return false
 	}
 	// Bit k of skip is key column k pinned; bit j of desc is the j-th column

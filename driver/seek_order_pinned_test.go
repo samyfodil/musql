@@ -44,7 +44,8 @@ func TestIndexSeekOrderPinnedColumns(t *testing.T) {
 		}
 		setup = append(setup, fmt.Sprintf(`INSERT INTO m%s VALUES(5001, 7.0, 3, 'real'), (5002, '7', 4, 'text'), (5003, 7.5, 5, 'half')`, ty))
 	}
-	setup = append(setup, `VACUUM`)
+	setup = append(setup, `CREATE TABLE e(id INTEGER PRIMARY KEY, g INT, l TEXT)`, `CREATE INDEX e_x ON e(g, -id)`,
+		`INSERT INTO e SELECT value, value % 50, 'l' || value FROM generate_series(1, 4000)`, `VACUUM`)
 	for _, s := range setup {
 		if _, err := db.Exec(s); err != nil {
 			t.Fatalf("%s: %v", s, err)
@@ -69,6 +70,19 @@ func TestIndexSeekOrderPinnedColumns(t *testing.T) {
 	first := answer(`SELECT t.id, (SELECT bINTEGER.l FROM bINTEGER WHERE bINTEGER.g = t.k) FROM t WHERE t.id <= 2`)
 	if want := "1:string:l2151 2:string:l2252"; first != want {
 		t.Errorf("first rows %s, want C's %s", first, want)
+	}
+	// An expression key column is no column of the row: the index's order is
+	// the highest rowid first.
+	if got, want := answer(`SELECT t.id, (SELECT l FROM e WHERE e.g = t.k) FROM t WHERE t.id <= 3`), "1:string:l3951 2:string:l3952 3:string:l3953"; got != want {
+		t.Errorf("expression index: %s, want C's %s", got, want)
+	}
+	for _, q := range []string{
+		`SELECT t.id, (SELECT l FROM e WHERE g = t.k%s) FROM t`,
+		`SELECT t.id, (SELECT group_concat(id) FROM (SELECT id FROM e WHERE g = t.k%s)) FROM t WHERE t.id %% 10 = 3`,
+	} {
+		if got, want := answer(fmt.Sprintf(q, "")), answer(fmt.Sprintf(q, " ORDER BY g, -id")); got != want {
+			t.Errorf("%s:\n got  %.300s\n want %.300s", q, got, want)
+		}
 	}
 	for _, b := range tables {
 		for _, q := range [][2]string{
