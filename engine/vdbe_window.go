@@ -301,12 +301,14 @@ func (p *windowPlan) windowRowCtx(m *vdbe, entry []Value, winVals []Value) *eval
 
 // windowRowCtxs hands out the windowRowCtx acc's step of a batch row runs
 // with. The only thing a step reads from its context's row is a collation
-// resolved against it, once per accumulator (aggItem.rowCollationPending), so
-// the row's columns and rowids are decoded only while acc may still resolve
-// one; otherwise the one shared context keeps whichever row it last held. An
-// aggregate with an ORDER BY keeps the context its collations resolved
-// against for the replay at finalize (aggItem.obBuffer), so that one gets a
-// context and a row of its own.
+// resolved against it, once per accumulator (aggItem.rowCollationPending),
+// and only a RIGHT or FULL join's USING column makes that depend on the row
+// (resolveCoalesceChain). So the row's columns and rowids are decoded only
+// while acc may still resolve one over such a join; otherwise the one shared
+// context keeps whichever row it last held. An aggregate with an ORDER BY
+// keeps the context its collations resolved against for the replay at
+// finalize (aggItem.obBuffer), so that one gets a context and a row of its
+// own.
 type windowRowCtxs struct {
 	m     *vdbe
 	plan  *windowPlan
@@ -314,6 +316,19 @@ type windowRowCtxs struct {
 	vals  [][]Value
 	ctx   *evalCtx
 	buf   []Value
+	// rowFree: no scope has a coalesce fallback, so no collation depends on
+	// the row it is resolved against.
+	rowFree bool
+}
+
+func newWindowRowCtxs(m *vdbe, plan *windowPlan, batch *windowRows, vals [][]Value) windowRowCtxs {
+	w := windowRowCtxs{m: m, plan: plan, batch: batch, vals: vals, rowFree: true}
+	for _, sc := range plan.scopes {
+		if sc.coalesceFallback != nil {
+			w.rowFree = false
+		}
+	}
+	return w
 }
 
 func (w *windowRowCtxs) at(ri int, acc *aggItem) *evalCtx {
@@ -326,7 +341,7 @@ func (w *windowRowCtxs) at(ri int, acc *aggItem) *evalCtx {
 		return p.windowRowCtx(w.m, w.batch.rangeInto(ri, 0, n, &row), w.vals[ri])
 	case w.ctx == nil:
 		w.ctx = p.windowRowCtx(w.m, w.batch.rangeInto(ri, 0, n, &w.buf), w.vals[ri])
-	case pending:
+	case pending && !w.rowFree:
 		entry := w.batch.rangeInto(ri, 0, n, &w.buf)
 		w.ctx.vals = entry[:p.nCols]
 		w.ctx.rowids = entry[p.nCols:n]
@@ -1280,7 +1295,7 @@ func (m *vdbe) windowAggregate(plan *windowPlan, call windowCall, ci int, part [
 		opBuf    []Value
 		argBuf   []Value
 	)
-	rows := windowRowCtxs{m: m, plan: plan, batch: batch, vals: vals}
+	rows := newWindowRowCtxs(m, plan, batch, vals)
 	if call.stepArgs != nil {
 		stepPM = call.stepArgs.machine(m)
 		stampWindowStepArgRegs(tmpl, plan, call)
