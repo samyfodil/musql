@@ -20,7 +20,7 @@ func TestWindowBufferRepresentationParity(t *testing.T) {
 			`(6, 'b', -7, 'six', x'06', -2.25),` +
 			`(7, 'c', 9223372036854775807, 'seven', x'07', 0.1),` +
 			`(8, 'c', -9223372036854775808, '8', x'', 8.0)`,
-		`INSERT INTO r SELECT 100+value, 'z', value, printf('%.*c', 3000+value, 'x'), x'', value*0.5 FROM generate_series(1,3)`,
+		`INSERT INTO r SELECT 100+value, 'z', value, hex(zeroblob(1500+value)), x'', value*0.5 FROM generate_series(1,3)`,
 		`SELECT k, typeof(lag(v) OVER w), quote(lag(v) OVER w), quote(lead(t) OVER w), quote(lead(b) OVER w), quote(lag(f) OVER w)
 		   FROM r WINDOW w AS (PARTITION BY g ORDER BY k) ORDER BY k`,
 		`SELECT k, quote(first_value(v) OVER w), quote(last_value(t) OVER w), quote(nth_value(b, 2) OVER w), typeof(nth_value(f, 2) OVER w)
