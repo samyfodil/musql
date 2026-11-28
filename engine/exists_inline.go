@@ -51,21 +51,12 @@ func existsInlinable(sub *Program) bool {
 		return false
 	}
 	for _, in := range sub.Insns {
-		if !existsInlineOperands(in) {
+		if !inlineOperands(in) {
 			return false
 		}
 		switch in.Op {
 		case OpOuterColumn, OpOuterRowid:
 			if in.P5 < 1 {
-				return false
-			}
-		case OpRewind:
-			if in.P4 != nil {
-				return false // a row-filter plan: not read here, so not relocated
-			}
-		case OpFunction:
-			// These two read the machine they run on, which inlining changes.
-			if name, isName := in.P4.(string); isName && (name == "rtreecheck" || name == "vec1_config") {
 				return false
 			}
 		case OpOpenDerived:
@@ -170,21 +161,6 @@ func progDeterministic(prog *Program, seen map[*Program]bool) bool {
 	return true
 }
 
-// existsInlineOperands reports whether in is an opcode whose operands this
-// pass knows: the whitelist relocate implements, operand by operand.
-func existsInlineOperands(in Instruction) bool {
-	switch in.Op {
-	case OpInit, OpOpenRead, OpRewind, OpNext, OpIfEmpty, OpClose, OpHalt, OpGoto,
-		OpColumn, OpRowid, OpOuterColumn, OpOuterRowid,
-		OpInteger, OpVariable, OpNull, OpString8, OpReal, OpSCopy, OpCopy,
-		OpEq, OpNe, OpLt, OpLe, OpGt, OpGe, OpIf, OpIfNot, OpIsNull, OpNotNull,
-		OpSeekRowidHint, OpSeekIndexHint, OpSeekRowidRangeHint, OpRowidReadBound, OpSeekRowidSetHint, OpAutoIndexOrder, OpSortedSeek, OpResultRow,
-		OpAdd, OpSubtract, OpMultiply, OpDivide, OpRemainder, OpConcat, OpFunction, OpOpenDerived:
-		return true
-	}
-	return false
-}
-
 // existsInline replaces prog.Insns[at], a correlated OpExists over sub, with a
 // Gosub into a relocated copy of sub appended to prog.
 //
@@ -207,76 +183,36 @@ func existsInline(prog *Program, at int, sub *Program) {
 	if not {
 		none, some = 1, 0
 	}
-	reg := func(r int) int { return r + regOff }
-	cur := func(c int) int { return c + curOff }
-	jump := func(a int) int { return body + a }
+	x := inlineReloc{regOff: regOff, curOff: curOff, slotOff: slotOff, jump: func(a int) int { return body + a }}
+	reg, cur := x.reg, x.cur
 
 	out := append(prog.Insns, Instruction{Op: OpInteger, P1: none, P2: dest})
 	for _, in := range sub.Insns {
-		r := in
+		var r Instruction
 		switch in.Op {
 		case OpInit:
-			r = Instruction{Op: OpGoto, P2: jump(in.P2)}
-		case OpGoto:
-			r.P2 = jump(in.P2)
+			r = Instruction{Op: OpGoto, P2: x.jump(in.P2)}
 		case OpHalt:
 			r = Instruction{Op: OpGoto, P2: done}
 		case OpResultRow:
 			r = Instruction{Op: OpGoto, P2: found}
-		case OpOpenRead, OpClose, OpAutoIndexOrder:
-			r.P1 = cur(in.P1)
-		case OpRewind, OpNext, OpIfEmpty:
-			r.P1, r.P2 = cur(in.P1), jump(in.P2)
-		case OpColumn:
-			r.P1, r.P3 = cur(in.P1), reg(in.P3)
-		case OpRowid:
-			r.P1, r.P2 = cur(in.P1), reg(in.P2)
 		case OpOuterColumn:
 			// One frame closer: level 1 is now this program's own cursor.
+			r = in
 			if in.P5 == 1 {
 				r = Instruction{Op: OpColumn, P1: in.P1, P2: in.P2, P3: reg(in.P3)}
 			} else {
 				r.P3, r.P5 = reg(in.P3), in.P5-1
 			}
 		case OpOuterRowid:
+			r = in
 			if in.P5 == 1 {
 				r = Instruction{Op: OpRowid, P1: in.P1, P2: reg(in.P2)}
 			} else {
 				r.P2, r.P5 = reg(in.P2), in.P5-1
 			}
-		case OpInteger, OpVariable, OpNull, OpString8, OpReal:
-			r.P2 = reg(in.P2)
-		case OpSCopy, OpCopy:
-			r.P1, r.P2 = reg(in.P1), reg(in.P2)
-		case OpEq, OpNe, OpLt, OpLe, OpGt, OpGe:
-			r.P1, r.P3 = reg(in.P1), reg(in.P3)
-			if in.P5&p5StoreP2 != 0 {
-				r.P2 = reg(in.P2)
-			} else {
-				r.P2 = jump(in.P2)
-			}
-		case OpIf, OpIfNot, OpIsNull, OpNotNull:
-			r.P1, r.P2 = reg(in.P1), jump(in.P2)
-		case OpSeekRowidHint, OpSeekIndexHint, OpSeekRowidRangeHint, OpRowidReadBound, OpSeekRowidSetHint:
-			r.P1, r.P2 = cur(in.P1), reg(in.P2)
-		case OpSortedSeek:
-			r.P1, r.P2, r.P4 = cur(in.P1), reg(in.P2), in.P4.(*sortedSeekHint).movedRegs(reg)
-		case OpAdd, OpSubtract, OpMultiply, OpDivide, OpRemainder, OpConcat:
-			r.P1, r.P2, r.P3 = reg(in.P1), reg(in.P2), reg(in.P3)
-		case OpFunction:
-			r.P1, r.P3 = reg(in.P1), reg(in.P3)
-		case OpOpenDerived:
-			ds := inlinedSource(in.P4.(*derivedSource))
-			if len(ds.vtabCorr) > 0 {
-				cp := *ds
-				cp.vtabCorr = make([]vtabCorrTerm, len(ds.vtabCorr))
-				for k, t := range ds.vtabCorr {
-					t.reg = reg(t.reg)
-					cp.vtabCorr[k] = t
-				}
-				ds = &cp
-			}
-			r.P1, r.P2, r.P4 = cur(in.P1), in.P2+slotOff, ds
+		default:
+			r = x.relocate(in)
 		}
 		out = append(out, r)
 	}

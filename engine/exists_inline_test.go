@@ -40,6 +40,8 @@ func TestExistsInlineMatchesSubProgram(t *testing.T) {
 		`SELECT k, count(*) FROM t WHERE EXISTS (SELECT 1 FROM b WHERE b.id = t.bid) GROUP BY k ORDER BY k`,
 		`SELECT count(*) FROM t AS o WHERE EXISTS (SELECT 1 FROM b WHERE b.id = o.bid AND EXISTS (SELECT 1 FROM t AS i WHERE i.id = o.id AND i.k = b.id % 5))`,
 		`SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM b WHERE b.id = t.bid AND b.id < ?)`,
+		// A scan whose leading WHERE compiles to a row filter on its Rewind.
+		`SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM b WHERE b.w < 3 AND b.label = 'l' || t.k)`,
 	}
 	run := func(stage string) {
 		for _, q := range queries {
@@ -57,6 +59,16 @@ func TestExistsInlineMatchesSubProgram(t *testing.T) {
 		}
 	}
 	run("segments")
+	filtered := queries[len(queries)-1]
+	_, ops, err := p.fast("EXPLAIN " + filtered)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range ops {
+		if string(r[1].S) == "Exists" {
+			t.Errorf("%s: the EXISTS was not inlined", filtered)
+		}
+	}
 	p.delta(`INSERT INTO b VALUES (1, 'new', 1.5)`, `DELETE FROM b WHERE id = 3`, `UPDATE t SET bid = 1 WHERE id = 2`, `INSERT INTO e VALUES (5, 5)`)
 	run("with log")
 }
